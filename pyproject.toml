@@ -3,5 +3,17 @@ name = "swarm"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "jinja2>=3.1.6",
+    "psutil>=7.0.0",
+    "pydantic>=2.11.4",
+    "rich>=14.0.0",
+    "tinygrad>=0.10.2",
+    "torch>=2.7.0",
+    "transformers>=4.51.3",
+    "websockets>=15.0.1",
+]
+
+[tool.uv.sources]
+tinygrad = { git = "https://www.github.com/tinygrad/tinygrad" }
