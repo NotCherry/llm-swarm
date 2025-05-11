@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 tests
+random_stuff
+*.safetensors
+*.json
