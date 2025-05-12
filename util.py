@@ -1,6 +1,9 @@
 from rich.logging import RichHandler
 import logging
 
+logging.getLogger("websockets").propagate = False
+logging.getLogger("requests").propagate = False
+
 
 FORMAT = "%(message)s"
 logging.basicConfig(

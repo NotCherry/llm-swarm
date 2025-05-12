@@ -6,7 +6,7 @@ import torch
 from transformers import AutoTokenizer
 from torch import nn
 from dataclasses import dataclass
-
+from util import log
 # utils
 
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -66,10 +66,10 @@ class Shard:
         return self.start_layer == 0
 
     def is_last_layer(self) -> bool:
-        return self.end_layer == self.n_layers - 1
+        return self.end_layer == (self.n_layers - 1)
 
     def get_layer_count(self) -> int:
-        return self.end_layer - self.start_layer + 1
+        return self.end_layer + 1
     def to_dict(self) -> dict:
         return {
         "model_id": self.model_id,
@@ -307,7 +307,10 @@ def remap_dict(state_dict):
 
 # remapped_state_dict = remap_dict(state_dict)
 
+
 def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tensor, int, dict[str, Any]]:
+
+
     if not ".safetensors" in str(fn):
         fn = f"{fn}/model.safetensors"
     
@@ -318,7 +321,6 @@ def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tenso
         data_start = int.from_bytes(size, "little")
         raw_data = f.read(data_start)
         data_start += 8
-        print(f"Loading {fn} with size {data_start}")
         return f, data_start, json.loads(raw_data.decode('utf-8'))
     
     raise ValueError(f"File {fn} not found")
@@ -328,7 +330,6 @@ def safe_load_metadata_multifile(fn: Union[str, pathlib.Path], l) -> tuple[torch
 
     weight_map = json.load(open(fn, "r"))['weight_map']
     layers_files = []
-    print(l)
     for k, v in weight_map.items():
         if l in k:
             layers_files.append(v)
@@ -344,7 +345,6 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
 
     fn = f"{model_path}/model.safetensors.index.json"
     # assert os.path.exists(fn), "safetensors.index.json not exists"
-
     layer_weights = {}
     f, data_start, metadata, loaded_all = (*safe_load_metadata_single(model_path), True)  if not os.path.exists(fn) else  safe_load_metadata_multifile(fn, l)
     last_layer = ""
@@ -352,6 +352,7 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
         last_layer = f"models.layers.{layer_index - 1}"
     for k in metadata.keys():
             if l in k or (not loaded_all and last_layer in k):
+                log.info(k)
                 layer_data = metadata[k]
                 f.seek(data_start + (layer_data['data_offsets'][0]))
                 size = layer_data['data_offsets'][1] - \
@@ -359,6 +360,7 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
                 data = f.read(size)
                 t = torch.frombuffer(data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
                 layer_weights[k] = t
+    f.close()
     dct = remap_dict(layer_weights)
 
     return dct

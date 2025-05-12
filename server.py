@@ -16,7 +16,6 @@ import torch
 from benchmarks import get_flops
 from util import log
 from tqdm.rich import tqdm
-import pickle
 import os
 from websockets.asyncio.server import serve
 from websockets.asyncio.client import connect
@@ -86,7 +85,7 @@ class NetworkConfig():
 
 
 NETWORK_TOPOLOGY = NetworkConfig(nodes={})
-network_topology_lock = threading.Lock()
+NETWORK_LOCK = threading.Lock()
 NETWORK_CHECKSUM = None
 
 def serialize_network_config(config: NetworkConfig) -> str:
@@ -142,6 +141,7 @@ def listen(sock):
                 ACTIVE_HOSTS.append(addr[0])
             if addr[0] not in NETWORK_TOPOLOGY.nodes.keys():
                 NETWORK_TOPOLOGY.nodes[addr[0]] = Node(ip=addr[0], spec=spec)
+                log.error(f"Node INIT {NETWORK_TOPOLOGY.nodes[addr[0]]}")
             elif spec !=  NETWORK_TOPOLOGY.nodes[addr[0]].spec:
                 NETWORK_TOPOLOGY.nodes[addr[0]].spec = spec
         if data['msg'] == "MASTERNODE" and ((START_TIME + WAIT_TIME) > time.perf_counter()):
@@ -151,8 +151,9 @@ def listen(sock):
             MASTER_NODE_IP = addr[0]
             # TODO Handle case when masternode Disapear
         if data['msg']  == "net_config":
-            NETWORK_TOPOLOGY.nodes =  deserialize_network_config(data["data"]).nodes
-            log.error(f"config recived {NETWORK_TOPOLOGY.nodes}")
+            with NETWORK_LOCK:
+                NETWORK_TOPOLOGY.nodes =  deserialize_network_config(data["data"]).nodes
+                log.error(f"config recived {NETWORK_TOPOLOGY.nodes}")
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
@@ -239,6 +240,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
         if current_layer == 0:
             mem -= layer_dict['model.embed_tokens.weight']
             del layer_dict['model.embed_tokens.weight']
+
         
         keys_to_remove = []
         log.debug(f"Node memory:{mem}")
@@ -251,7 +253,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
                 # Create shard for previous layers
                 if last_node_ip != None:
                      NETWORK_TOPOLOGY.nodes[key].next_node_ip = last_node_ip
-                shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers, False)
+                shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers + 1, False)
                 NETWORK_TOPOLOGY.nodes[key].shard = shard
                 start_layer = current_layer
                 last_node_ip = key
@@ -259,7 +261,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
 
         # Handle case where all layers fit in memory
         if current_layer > start_layer and sorted_layers and "layer" in sorted_layers[-1][0]:
-            shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers, False)
+            shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers + 1, False)
             NETWORK_TOPOLOGY.nodes[key].shard = shard
 
         for k in keys_to_remove:
@@ -273,8 +275,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
         
     log.debug("Planing network compleate")
     for k, n in NETWORK_TOPOLOGY.nodes.items():
-        if n.ip != local_address:
-            sock.sendto(net_config_bytes, (n.ip, PEER_PORT))
+        sock.sendto(net_config_bytes, (n.ip, PEER_PORT))
         log.info(f"Node: {k} - {n.shard}")
 
 def get_model_metadata(url, meta_folder="meta"):
@@ -288,10 +289,8 @@ def get_model_metadata(url, meta_folder="meta"):
                 headers["Authorization"] = f"Bearer {hf_token}"
 
             response = requests.get(url, headers=headers)
-            print("con", response.content)
             # Interpret the bytes as a little-endian unsigned 64-bit integer
             length_of_header = struct.unpack('<Q', response.content)[0]
-            print(length_of_header)
             # Fetch length_of_header bytes starting from the 9th byte
             headers['Range'] = f'bytes=8-{7 + length_of_header}'
             response = requests.get(url, headers=headers)
@@ -323,7 +322,7 @@ def get_model_metadata(url, meta_folder="meta"):
                 f.write(json.dumps(data))
                 if not os.path.exists(meta_folder):
                     os.makedirs(meta_folder)
-                    print(f"Created folder: {meta_folder}")
+                    log.info(f"Created folder: {meta_folder}")
                 with open(f"{meta_folder}/{fn_meta}", 'w') as ff:
                     ff.write(json.dumps(meta))
                 return meta    
@@ -366,7 +365,6 @@ async def shard_planner():
         async def run_it(layers_dict):
             global NETWORK_CHECKSUM
 
-            # TODO: Reair MAX not working
             end_layer = max([int(k.split(".")[2]) for k in layers_dict.keys() if "model.layer" in k])
             await plan_network_from_layers(layers_dict,  end_layer)
 
@@ -429,13 +427,13 @@ def update_network():
         log.info(ACTIVE_HOSTS)    
     
     def master_node():
-        global SHARDING_SERVICE
+        global SHARDING_SERVICE, MASTER_NODE_IP
         if START_TIME + WAIT_TIME < time.perf_counter() and MASTER_NODE:
             log.debug("Brodcasting Master Node")
             for host in ACTIVE_HOSTS:
                 sock.sendto(master_node_bytes, (host, PEER_PORT))
+            MASTER_NODE_IP = local_address                
             if not SHARDING_SERVICE:
-                Process(target=plan_network, args=()).start()
                 SHARDING_SERVICE = True
     
     time.sleep(5)
@@ -443,8 +441,12 @@ def update_network():
         master_node()
         log.info(f"Node Type {'Master' if MASTER_NODE else 'Worker'}")
         ACTIVE_HOSTS = []
-        NETWORK_TOPOLOGY.nodes = {}
         detect()
+        with NETWORK_LOCK:
+            keys = list(NETWORK_TOPOLOGY.nodes.keys())
+            for key in keys:
+                if key not in ACTIVE_HOSTS:
+                    del NETWORK_TOPOLOGY.nodes[key]
         time.sleep(5)
 
 def convert_and_sort_by_offset(metadata):
@@ -521,7 +523,7 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
     layers_to_dwonload = None
 
     node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
-    print(node_key, local_address)
+    
     assert node_key == local_address
 
     # Open file for writing in binary mode
@@ -606,41 +608,48 @@ async def comunicate(websocket):
     async for message in websocket:
         message = json.loads(message)
         if message['type'] == "layer_data":
-            MODEL.load_state_dict(message.data, strict=False)
+            MODEL.load_state_dict(message['data'], strict=False)
         if message['type'] == "llm-decode":
             log.info(f"Chat output: \n {message['data']}")    
         if message['type'] == "gen":
             ## GEN
-            print(NETWORK_TOPOLOGY)
             n = NETWORK_TOPOLOGY.nodes[local_address] 
             first_layer = n.shard.is_first_layer()
-            last_layer = n.shard.is_last_layer()
+            last_layer = n.shard.is_last_layer()            
 
-            h, p_ids, att = model_generate_text(
+            result = model_generate_text(
                     MODEL, 
-                    input_text=message.data['prompt'] if first_layer else "",
+                    input_text=message['data']['prompt'] if first_layer else "",
                     first_layer=first_layer,
                     last_layer=last_layer,
-                    h=message.data['h'] if not first_layer else None,
-                    p_ids=message.data['p_ids'] if not first_layer else None,
-                    att=message.data['att'] if not first_layer else None,
+                    h=torch.tensor(message['data']['h']) if not first_layer else None,
+                    p_ids=torch.tensor(message['data']['p_ids']) if not first_layer else None,
+                    att=torch.tensor(message['data']['att']) if not first_layer else None,
                     )
-            
+            if isinstance(result, tuple) and len(result) == 3:
+                h, p_ids, att = result
+            else:
+                output = result
 
             if not last_layer:
-                await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "h": h, "p_ids": p_ids, "att": att }})
+                await brodcast_data_to_node(node_ip=n.next_node_ip, data={ "type":"gen", "data": { "h": h.tolist(), "p_ids": p_ids.tolist(), "att": att.tolist() if att is not None else None}})
                 return
             
             # if last layer returned is bool teling if continue
-            if isinstance(h, bool) and not h:
+            if isinstance(output, bool) and not output:
                 return
             
-            # retun user the respone
-            await brodcast_data_to_node(node_ip=MASTER_NODE_IP, data={"type": "llm-decode", "data": h})
             # the loop not ended run next iter
             # TODO: Limit token output
-            await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : h }})
-            
+            await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : output }})
+
+            # retun user the respone
+            log.error(f"{local_address} {MASTER_NODE_IP}")
+            if local_address != MASTER_NODE_IP:
+                await brodcast_data_to_node(node_ip=MASTER_NODE_IP, data={"type": "llm-decode", "data": output})
+            else:
+                log.info(output)
+
             
             
 
@@ -660,19 +669,24 @@ def wsserver():
         loop.close()
 
 async def swarm_discover(sock):
-    global MODEL, NETWORK_TOPOLOGY
+    global MODEL, NETWORK_TOPOLOGY, SHARDING_SERVICE
+
     threading.Thread(target=listen, args=(sock,)).start()
     threading.Thread(target=update_network).start()
     threading.Thread(target=wsserver).start()
     
     while True:
+        if SHARDING_SERVICE:
+            threading.Thread(target=plan_network, args=()).start()
+            break
+   
+    while True:
         time.sleep(1)
         if local_address in NETWORK_TOPOLOGY.nodes.keys():
-            # log.error(f"{NETWORK_TOPOLOGY.nodes[local_address].shard}")
             if NETWORK_TOPOLOGY.nodes[local_address].shard is not None:
                 break
     # shard1 = Shard("LLAMA-3.2-1B", 0, 15, 16, True)
-    NETWORK_TOPOLOGY.nodes[local_address].shard.loaded = False
+    NETWORK_TOPOLOGY.nodes[local_address].shard.loaded = True
     log.error(f'{NETWORK_TOPOLOGY.nodes[local_address].shard}')
     MODEL = build_transformer(".", NETWORK_TOPOLOGY.nodes[local_address].shard)
 
