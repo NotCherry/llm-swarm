@@ -455,10 +455,12 @@ def model_generate_text(
         decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print(decoded_output)
         if next_token_id.item() == end_token_id:
-            assert False, "implement Brodcast end to masternode "
+            # assert False, "implement Brodcast end to masternode "
+            return False
 
         decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print("Output:", decoded_output)
+        return decoded_output
 
 
 if __name__ == '__main__':
