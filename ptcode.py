@@ -7,6 +7,8 @@ from transformers import AutoTokenizer
 from torch import nn
 from dataclasses import dataclass
 from util import log
+import gc
+
 # utils
 
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -103,11 +105,12 @@ class LlamaModel(nn.Module):
             "rms_norm_eps": 1e-5,
             "rope_theta": 500000.0,
             "num_key_value_heads": 8,
+            "dtype": torch.bfloat16
         }
         self.shard = shard
         self.model = nn.ModuleDict()
         if self.shard.is_first_layer():
-            self.model["embed_tokens"] = nn.Embedding(self.config["vocab_size"], self.config["hidden_size"])
+            self.model["embed_tokens"] = nn.Embedding(self.config["vocab_size"], self.config["hidden_size"], dtype=self.config["dtype"])
         
         # Create only the layers within the shard's range, with correct indices
         self.model["layers"] = nn.ModuleDict({
@@ -115,8 +118,8 @@ class LlamaModel(nn.Module):
         })
         
         if self.shard.is_last_layer():
-            self.model["norm"] = RMSNorm(self.config["hidden_size"], self.config["rms_norm_eps"])
-            self.lm_head = nn.Linear(self.config["hidden_size"], self.config["vocab_size"], bias=False)
+            self.model["norm"] = nn.RMSNorm(self.config["hidden_size"], self.config["rms_norm_eps"], dtype=self.config["dtype"])
+            self.lm_head = nn.Linear(self.config["hidden_size"], self.config["vocab_size"], bias=False, dtype=self.config["dtype"])
 
     def _transformer_block(self):
         return TransformerBlock(
@@ -125,7 +128,8 @@ class LlamaModel(nn.Module):
             intermediate_size=self.config["intermediate_size"],
             num_key_value_heads=self.config["num_key_value_heads"],
             rope_theta=self.config["rope_theta"],
-            rms_norm_eps=self.config["rms_norm_eps"]
+            rms_norm_eps=self.config["rms_norm_eps"],
+            dtype=self.config["dtype"]
         )
     
     def forward(self, input_ids=None, hidden_states=None, position_ids=None, attention_mask=None):
@@ -175,7 +179,7 @@ class LlamaModel(nn.Module):
             return None # Return None if not the last shard
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    def __init__(self, dim, eps=1e-5, dtype=torch.bfloat16):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -186,14 +190,14 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, intermediate_size, num_key_value_heads, rope_theta, rms_norm_eps):
+    def __init__(self, hidden_size, num_attention_heads, intermediate_size, num_key_value_heads, rope_theta, rms_norm_eps, dtype):
         super().__init__()
         self.self_attn = MultiHeadAttention(
-            hidden_size, num_attention_heads, num_key_value_heads, rope_theta
+            hidden_size, num_attention_heads, num_key_value_heads, rope_theta, dtype=dtype
         )
-        self.mlp = FeedForward(hidden_size, intermediate_size)
-        self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
+        self.mlp = FeedForward(hidden_size, intermediate_size, dtype)
+        self.input_layernorm = nn.RMSNorm(hidden_size, rms_norm_eps, dtype)
+        self.post_attention_layernorm = nn.RMSNorm(hidden_size, rms_norm_eps, dtype)
 
     def forward(self, hidden_states, position_ids, attention_mask):
         residual = hidden_states
@@ -207,7 +211,7 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, num_key_value_heads, rope_theta):
+    def __init__(self, hidden_size, num_attention_heads, num_key_value_heads, rope_theta, dtype):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -215,11 +219,12 @@ class MultiHeadAttention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.key_value_dim = self.num_key_value_heads * self.head_dim
         self.rope_theta = rope_theta
+        self.dtype = dtype
 
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_value_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.key_value_dim, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(hidden_size, self.key_value_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(hidden_size, self.key_value_dim, bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype)
 
     def forward(self, hidden_states, position_ids, attention_mask):
         batch_size, seq_len, _ = hidden_states.shape
@@ -236,7 +241,7 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         if attention_mask is not None:
             scores = scores + attention_mask
-        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = torch.softmax(scores, dim=-1, dtype=self.dtype)
         context = torch.matmul(attn_weights, v)
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         return self.o_proj(context)
@@ -273,11 +278,11 @@ class MultiHeadAttention(nn.Module):
         return q, k
 
 class FeedForward(nn.Module):
-    def __init__(self, hidden_size, intermediate_size):
+    def __init__(self, hidden_size, intermediate_size, dtype):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, dtype=dtype)
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
@@ -359,6 +364,7 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
                     layer_data['data_offsets'][0]
                 data = f.read(size)
                 t = torch.frombuffer(data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
+                del data
                 layer_weights[k] = t
     f.close()
     dct = remap_dict(layer_weights)
@@ -398,11 +404,11 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
             loaded_keys = loaded_keys + ['lm_head.weight']
         model.load_state_dict(weights, strict=False)
     
-    
     expected_keys = set(dict(model.named_parameters()).keys())
     loaded_keys = set(loaded_keys)
     print("Missing:", expected_keys - loaded_keys)
     print("Unexpected:", loaded_keys - expected_keys)
+    gc.collect()
     return model
 
 
@@ -470,20 +476,23 @@ if __name__ == '__main__':
     model2 = None
 
     try:
-        shard1 = Shard("LLAMA-3.2-1B", 0, 7, 16, True)
+        # shard1 = Shard("LLAMA-3.2-1B", 0, 7, 16, True)
+        # model = build_transformer(".", shard1)
+        # shard2 = Shard("LLAMA-3.2-1B", 8, 15, 16, True)
+        # model2 = build_transformer(".", shard2)
+
+        shard1 = Shard("LLAMA-3.2-1B", 0, 15, 16, True)
         model = build_transformer(".", shard1)
-        shard2 = Shard("LLAMA-3.2-1B", 8, 15, 16, True)
-        model2 = build_transformer(".", shard2)
     except RuntimeError as e:
         raise "We are cooked"
 
-    assert model != None and model2 != None
+    # assert model != None and model2 != None
 
     model.to(device)
     model.eval()
 
-    model2.to(device)
-    model2.eval()
+    # model2.to(device)
+    # model2.eval()
 
     # Example inference with top-p sampling
     input_text = "how to never give up on goal"
@@ -498,8 +507,9 @@ if __name__ == '__main__':
         temperature = 0.7
 
         for _ in range(max_length):
-            h, p_ids, att = model(generated_ids)
-            logits = model2(hidden_states=h, position_ids=p_ids, attention_mask=att)
+            # h, p_ids, att = model(generated_ids)
+            # logits = model2(hidden_states=h, position_ids=p_ids, attention_mask=att)
+            logits = model(generated_ids)
             next_token_logits = logits[:, -1, :] / temperature
 
             # Top-p (nucleus) sampling

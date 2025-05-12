@@ -17,3 +17,8 @@ dependencies = [
 
 [tool.uv.sources]
 tinygrad = { git = "https://www.github.com/tinygrad/tinygrad" }
+
+[dependency-groups]
+dev = [
+    "memray>=1.17.2",
+]
