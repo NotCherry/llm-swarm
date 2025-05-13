@@ -2,14 +2,12 @@ import json
 import socket
 import struct
 import threading
-from multiprocessing import Process
 import time
 import asyncio
 from typing import Dict, List, Literal, Optional
 import time
 from dataclasses import asdict, dataclass 
 import requests
-import io
 from ptcode import Shard, build_transformer, safe_load_layer, LlamaModel, model_generate_text
 import psutil
 import torch
@@ -21,6 +19,9 @@ from websockets.asyncio.server import serve
 from websockets.asyncio.client import connect
 import hashlib
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def get_outbound_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -375,8 +376,6 @@ async def shard_planner():
             await plan_network_from_layers(layers_dict,  end_layer)
 
             NETWORK_CHECKSUM = DictChecksumTracker(NETWORK_TOPOLOGY.nodes)._checksum
-            # important uncoment after testing
-            # await download_file_with_metadata(url=url, hf_token=os.getenv('HF_TOKEN'))
 
         if isinstance(metadata, list) or 'format' in metadata['__metadata__'].keys():
             del metadata["__metadata__"]
