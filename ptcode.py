@@ -111,6 +111,7 @@ class LlamaModel(nn.Module):
             "dtype": torch.bfloat16
         }
         self.shard = shard
+        self.loaded_keys = []
         self.model = nn.ModuleDict()
         if self.shard.is_first_layer():
             self.model["embed_tokens"] = nn.Embedding(self.config["vocab_size"], self.config["hidden_size"], dtype=self.config["dtype"])
@@ -156,30 +157,65 @@ class LlamaModel(nn.Module):
             # brodcast_state(self.shard.end_layer, hidden_states)
             return hidden_states, position_ids, attention_mask
 
-    def forward2(self, input_ids, attention_mask=None):
-        # Version for local testing
-        # Get initial hidden states
-        if self.shard.is_first_layer():
-            hidden_states = self.model["embed_tokens"](input_ids)
-        else:
-            hidden_states = poll_state(self.shard.start_layer - 1)
+    # def forward2(self, input_ids, attention_mask=None):
+    #     # Version for local testing
+    #     # Get initial hidden states
+    #     if self.shard.is_first_layer():
+    #         hidden_states = self.model["embed_tokens"](input_ids)
+    #     else:
+    #         hidden_states = poll_state(self.shard.start_layer - 1)
 
-        batch_size, seq_len = input_ids.shape
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+    #     batch_size, seq_len = input_ids.shape
+    #     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         
-        # Process only the layers in this shard
-        for i in range(self.shard.start_layer, self.shard.end_layer + 1):
-            layer = self.model["layers"][str(i)]
-            hidden_states = layer(hidden_states, position_ids, attention_mask)
+    #     # Process only the layers in this shard
+    #     for i in range(self.shard.start_layer, self.shard.end_layer + 1):
+    #         layer = self.model["layers"][str(i)]
+    #         hidden_states = layer(hidden_states, position_ids, attention_mask)
         
-        # Final processing if last shard, otherwise broadcast
-        if self.shard.is_last_layer():
-            hidden_states = self.model["norm"](hidden_states)
-            logits = self.lm_head(hidden_states)
-            return logits
+    #     # Final processing if last shard, otherwise broadcast
+    #     if self.shard.is_last_layer():
+    #         hidden_states = self.model["norm"](hidden_states)
+    #         logits = self.lm_head(hidden_states)
+    #         return logits
+    #     else:
+    #         brodcast_state(self.shard.end_layer, hidden_states)
+    #         return None # Return None if not the last shard
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        super().load_state_dict(state_dict, strict, assign)
+        self.loaded_keys.extend(state_dict.keys())
+    def compare_model(self, model):
+        state_dict1 = self.state_dict()
+        state_dict2 = model.state_dict()
+
+        # Check for mismatched layers
+        mismatches = []
+        for key in state_dict1.keys():
+            if key not in state_dict2:
+                mismatches.append(f"Key {key} is in m but missing in m2")
+            else:
+                # Check if tensor values are identical
+                if not torch.equal(state_dict1[key], state_dict2[key]):
+                    mismatches.append(f"Layer {key} has mismatched values")
+                # Check shapes
+                if state_dict1[key].shape != state_dict2[key].shape:
+                    mismatches.append(f"Layer {key} has shape {state_dict1[key].shape} in m but {state_dict2[key].shape} in m2")
+
+        # Check for keys in m2 that are not in m
+        for key in state_dict2.keys():
+            if key not in state_dict1:
+                mismatches.append(f"Key {key} is in m2 but missing in m")
+
+        # Print results
+        if mismatches:
+            print("Mismatched layers found:")
+            for mismatch in mismatches:
+                print(f" - {mismatch}")
         else:
-            brodcast_state(self.shard.end_layer, hidden_states)
-            return None # Return None if not the last shard
+            print("All layers match perfectly, including nn.ModuleDict sub-models!")
+
+
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5, dtype=torch.bfloat16):
@@ -400,7 +436,7 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
         model.load_state_dict(weights, strict=False)     
         
         weights = safe_load_by_layer(model_path, l="output.weight")
-        if len(weights.keys()) < 1:
+        if len(weights.keys()) < 1 and "lm_head.weight" not in loaded_keys:
             weights = safe_load_by_layer(model_path, l="model.embed_tokens")
             weights['lm_head.weight'] = weights['model.embed_tokens.weight']
             loaded_keys = loaded_keys + ['lm_head.weight']
@@ -411,6 +447,8 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
     print("Missing:", expected_keys - loaded_keys)
     print("Unexpected:", loaded_keys - expected_keys)
     gc.collect()
+    
+    model.to(device)
     return model
 
 

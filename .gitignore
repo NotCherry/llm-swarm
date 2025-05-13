@@ -12,3 +12,5 @@ tests
 random_stuff
 *.safetensors
 *.json
+.env
+*.log*

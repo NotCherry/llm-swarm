@@ -1,4 +1,5 @@
 import json
+from queue import Queue
 import socket
 import struct
 import threading
@@ -20,6 +21,7 @@ from websockets.asyncio.client import connect
 import hashlib
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from safetensors.torch import save_file
 
 load_dotenv()
 
@@ -60,11 +62,26 @@ WAIT_TIME = 10
 SHARDING_SERVICE = False
 METADATA_STORE: Dict[str, str] = {}
 
-
+LOAD_LAYER_QUEUE = Queue()
 MODEL: LlamaModel = None
+MODEL_LOCK = threading.Lock()
+
+def layer_consumer(queue):
+    global MODEL 
+    while True:
+        item = LOAD_LAYER_QUEUE.get()  # Get item from queue (blocks if empty)
+        if item is None:
+            queue.task_done()
+            break
+        with MODEL_LOCK:
+            MODEL.load_state_dict(item, strict=False)
+            
+        print(f'Layer loaded')
+        queue.task_done()  # Mark task as done
+
 
 class DeviceSpec(BaseModel):
-    device: Literal["CPU", "GPU"]
+    device: Literal["cpu", "cuda"]
     name: str
     ram: int
     ram_type: Literal["RAM", "VRAM"]
@@ -109,9 +126,9 @@ def deserialize_network_config(json_str: str) -> NetworkConfig:
     return NetworkConfig(nodes=nodes)
 
 def detect_device():
-    if torch.cuda.is_available() and torch.backends.cudnn.enabled:
+    if torch.cuda.is_available():
         return DeviceSpec(
-            device="GPU",
+            device="cuda",
             name=torch.cuda.get_device_name(torch.cuda.current_device()),
             ram=torch.cuda.mem_get_info()[0],
             ram_type="VRAM",
@@ -120,11 +137,11 @@ def detect_device():
     
     memory = psutil.virtual_memory()
     return DeviceSpec(
-        device="CPU",
-        name="CPU",
+        device="cpu",
+        name="cpu",
         ram=memory.available,
         ram_type="RAM",
-        tflops=get_flops()[0]
+        tflops=0
     )
 
 @dataclass
@@ -191,7 +208,7 @@ def layers_size(metadata) -> Dict[str, int]:
     # TODO: sum layer begining with model.layers.{i}
     layer_size = 0
     layer_number = 0
-
+    
     if isinstance(metadata, list):
         for layer in metadata:
             s = layer[1]['data_offsets'][1] - layer[1]['data_offsets'][0]
@@ -208,7 +225,6 @@ def layers_size(metadata) -> Dict[str, int]:
 
     else:
         for key, layer in metadata.items():
-
             s = layer['data_offsets'][1] - layer['data_offsets'][0]
             if "model.layers" in key:
                 l_number = int(key.split('.')[2])
@@ -221,8 +237,7 @@ def layers_size(metadata) -> Dict[str, int]:
                 continue
             d[key] = s         
     
-    if "lm_head.weight" not in d.keys():
-        d["lm_head.weight"] = d["model.embed_tokens.weight"]
+   
     return d
         
 
@@ -261,7 +276,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
             else:
                 # Create shard for previous layers
                 if last_node_ip != None:
-                     NETWORK_TOPOLOGY.nodes[key].next_node_ip = last_node_ip
+                    NETWORK_TOPOLOGY.nodes[key].next_node_ip = last_node_ip
                 shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers + 1, False)
                 NETWORK_TOPOLOGY.nodes[key].shard = shard
                 start_layer = current_layer
@@ -382,7 +397,14 @@ async def shard_planner():
 
         if isinstance(metadata, list) or 'format' in metadata['__metadata__'].keys():
             del metadata["__metadata__"]
+            
+            # add lm_head does not exist in smaller model account for loading embed layer as it 
+            if "output" not in metadata.keys() and "lm_head" not in metadata.keys():
+                metadata["lm_head.weight"] = metadata['model.embed_tokens.weight']
             layers_dict = layers_size(metadata)
+            del metadata["lm_head.weight"]
+
+
             model_size = sum([ v for k, v in layers_dict.items()])
             log.debug(f"Model size: {model_size}")
 
@@ -458,7 +480,7 @@ def update_network():
             for key in keys:
                 if key not in ACTIVE_HOSTS:
                     del NETWORK_TOPOLOGY.nodes[key]
-        time.sleep(7 - (time.perf_counter() - time_start))
+        time.sleep(7 - (time.perf_counter() - time_start) if (time.perf_counter() - time_start) > 0 else 0)
 
 def convert_and_sort_by_offset(metadata):
     # Convert dict to list of (key, value) tuples
@@ -471,9 +493,10 @@ def convert_and_sort_by_offset(metadata):
     return sorted_items
 
 def init_model():
-    global MODEL, NETWORK_TOPOLOGY
+    global MODEL, MODEL_LOCK, NETWORK_TOPOLOGY
     shard: Shard = NETWORK_TOPOLOGY.nodes[local_address].shard
-    MODEL = LlamaModel(shard)
+    with MODEL_LOCK:
+        MODEL = LlamaModel(shard)
     
 
 def find_key_of_node_with_layer(topology: NetworkConfig, layer: int) -> Optional[str]:
@@ -485,10 +508,10 @@ async def brodcast_data_to_node(node_ip, data):
     
 
 async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
-    global NETWORK_TOPOLOGY, local_address, MODEL
+    global NETWORK_TOPOLOGY, local_address, MODEL, MODEL_LOCK
     state_dict = {}
     for layer_name, layer_data in layer_data.items():
-        state_dict = safe_load_layer(layer_name, layer_dtype=layer_data['info']['dtype'], layer_shape=layer_data['info']['shape'], data=layer_data['data'])
+        state_dict[layer_name] = safe_load_layer(layer_name, layer_dtype=layer_data['info']['dtype'], layer_shape=layer_data['info']['shape'], data=layer_data['data'])[layer_name]
     
     log.warning(f"{node} - {local_address}")
     log.info(f"Loading Layers to model {state_dict.keys()}")    
@@ -497,13 +520,21 @@ async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
         return
     if MODEL is None: 
         init_model()
-    MODEL.load_state_dict(state_dict, strict=False)
+    # LOAD_LAYER_QUEUE.put(state_dict)
+    with MODEL_LOCK:
+        MODEL.load_state_dict(state_dict, strict=False)
+
+
 
 # co wtedy gdy podczas pobierania dla danej konfiguracji node zostanie wyłączony
 # co gdy pojawią się nowę podczas pobierania ? dodatkowo przy wspieraniu FSDP?
 
 async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*10):
     global NETWORK_TOPOLOGY, local_address
+
+    node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
+    
+    assert node_key == local_address
 
     NETWORK_TOPOLOGY.loading_model = True
     NETWORK_TOPOLOGY.loaded_model = False
@@ -513,7 +544,7 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
         headers["Authorization"] = f"Bearer {hf_token}"
     
     # Get file size for progress bar (if available)
-    response = requests.head(url, headers=headers)
+    response = requests.head(url, headers=headers, allow_redirects=True)
     file_size = int(response.headers.get("content-length", 0))
 
     # Stream the download
@@ -524,24 +555,18 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
 
     # Variables for metadata parsing
     header_size = None
-    buffer = bytearray(40 * 1024)
+    buffer = bytearray(chunk_size)
     last_buffer_pointer = 0
     buffer_pointer = 0
     data_dict = {}
 
     metadata = None
-
     layers_to_dwonload = None
+    file_size = os.path.getsize("model.safetensors")
 
-    node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
-    
-    assert node_key == local_address
-
-    # Open file for writing in binary mode
     with tqdm(total=file_size, unit="B") as pbar:
         for chunk in response.iter_content(chunk_size=chunk_size):
             if chunk:  # Filter out keep-alive chunks
-                # Write chunk to file
                 pbar.update(len(chunk))
 
                 buffer_pointer += len(chunk)
@@ -551,7 +576,6 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
                 # Read header size (first 8 bytes)
                 if header_size is None and len(buffer) >= 8:
                     header_size = struct.unpack("<Q", buffer[:8])[0]
-                    log.debug(header_size)
 
                 # Read JSON header once we have enough data
                 elif header_size is not None and buffer_pointer >= 8 + header_size and metadata is None:
@@ -559,18 +583,34 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
                     header_data = b.decode()
                     metadata = json.loads(header_data)
                     del metadata["__metadata__"]
+                
                     max_layer_size = max([ s for k, s in  layers_size(metadata).items() ])
                     layers_to_dwonload = convert_and_sort_by_offset(metadata)
 
+                    buffer_copy = buffer[8 + header_size:]
                     buffer = bytearray(max_layer_size)
-                    buffer_pointer = 0
-                    last_buffer_pointer = 0
+                    buffer[:len(buffer_copy)] = buffer_copy
+
+                    buffer_pointer = len(buffer_copy)
+                    last_buffer_pointer = len(buffer_copy)
 
                 elif metadata is not None:
-                    next_layer_lenght = layers_to_dwonload[0][1]['data_offsets'][1] - layers_to_dwonload[0][1]['data_offsets'][0]
-                    if buffer_pointer > next_layer_lenght:
-                        node_key = None
+                    # Ensure buffer is a bytearray for mutability
+                    if not isinstance(buffer, bytearray):
+                        buffer = bytearray(buffer)
+
+                    while layers_to_dwonload:
+                        # Calculate layer length
+                        layer_info = layers_to_dwonload[0][1]
+                        next_layer_lenght = layer_info['data_offsets'][1] - layer_info['data_offsets'][0]
+                        
+                        # Check if buffer has enough data
+                        if buffer_pointer < next_layer_lenght:
+                            break
+
+                        # Process layer
                         layer_name = layers_to_dwonload[0][0]
+                        node_key = None
                         l_num = None
                         if "model.layers" in layer_name:
                             l_num = int(layer_name.split('.')[2])
@@ -580,23 +620,42 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
                         elif "model.norm" in layer_name or "output.weight" in layer_name:
                             last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
                             node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                        
+                        if node_key is None:
+                            log.error(f"Failed to find node_key for layer: {layer_name}")
+                            break
+
+                        # Extract layer data
                         l_data = buffer[:next_layer_lenght]
                         log.info(f"Downloaded Layer for node: {node_key}, Name: {layer_name}")
-                        
+                        data_dict[layer_name] = {"data": l_data, "info": layer_info}
 
-                        data_dict[layer_name] = { "data": l_data, "info": layers_to_dwonload[0][1] }
+                        # Remove processed layer
                         del layers_to_dwonload[0]
-                        layers_number_in_queue = set([int(x[0].split(".")[2]) for x in layers_to_dwonload if "model.layers" in x[0]])
+
+                        # Shift buffer left
+                        buffer[:last_buffer_pointer - next_layer_lenght] = buffer[next_layer_lenght:last_buffer_pointer]
+                        # Zero out the remaining space
+                        buffer[last_buffer_pointer - next_layer_lenght:last_buffer_pointer] = bytes(last_buffer_pointer - next_layer_lenght)
+
+                        # Update pointers
+                        last_buffer_pointer -= next_layer_lenght
+                        buffer_pointer -= next_layer_lenght
+
+                        # Optional: Check if we need to skip further processing
+                        layers_number_in_queue = set(int(x[0].split(".")[2]) for x in layers_to_dwonload if "model.layers" in x[0])
                         if l_num is not None and l_num in layers_number_in_queue:
                             continue
-
                         await broadcast_layer_to_node(node_key, data_dict)
+                        if "model.embed_tokens.weight" == layer_name and "output.weight" not in metadata.keys():
+                            data_dict['lm_head.weight'] = data_dict['model.embed_tokens.weight']
+                            del data_dict['model.embed_tokens.weight']
+                            last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
+                            node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                            await broadcast_layer_to_node(node_key, data_dict)
 
                         data_dict = {}
-                        buffer[:last_buffer_pointer] = bytes(last_buffer_pointer)
-                        last_buffer_pointer = 0
-                        buffer_pointer = 0
-            
+                        
     NETWORK_TOPOLOGY.loading_model = False                
     NETWORK_TOPOLOGY.loaded_model = True
     log.info(f"Download of model {SELECTED_MODEL} completed")
@@ -614,30 +673,34 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
 #
 
 async def comunicate(websocket):
-    global MODEL, NETWORK_TOPOLOGY, local_address, MASTER_NODE_IP
+    global MODEL, NETWORK_TOPOLOGY, local_address, MASTER_NODE_IP, MODEL_LOCK
     async for message in websocket:
         message = json.loads(message)
         if message['type'] == "layer_data":
-            MODEL.load_state_dict(message['data'], strict=False)
+            with MODEL_LOCK:
+                MODEL.load_state_dict(message['data'], strict=False)
         if message['type'] == "llm-decode":
             log.info(f"Chat output: \n {message['data']}")    
         if message['type'] == "gen":
             ## GEN
             NETWORK_TOPOLOGY.generating = True
+            with MODEL_LOCK:
+                MODEL.to(device=NETWORK_TOPOLOGY.nodes[local_address].spec.device)
+                MODEL.eval()
 
             n = NETWORK_TOPOLOGY.nodes[local_address] 
             first_layer = n.shard.is_first_layer()
             last_layer = n.shard.is_last_layer()            
-
-            result = model_generate_text(
-                    MODEL, 
-                    input_text=message['data']['prompt'] if first_layer else "",
-                    first_layer=first_layer,
-                    last_layer=last_layer,
-                    h=torch.tensor(message['data']['h']) if not first_layer else None,
-                    p_ids=torch.tensor(message['data']['p_ids']) if not first_layer else None,
-                    att=torch.tensor(message['data']['att']) if not first_layer else None,
-                    )
+            with MODEL_LOCK:
+                result = model_generate_text(
+                        MODEL, 
+                        input_text=message['data']['prompt'] if first_layer else "",
+                        first_layer=first_layer,
+                        last_layer=last_layer,
+                        h=torch.tensor(message['data']['h']) if not first_layer else None,
+                        p_ids=torch.tensor(message['data']['p_ids']) if not first_layer else None,
+                        att=torch.tensor(message['data']['att']) if not first_layer else None,
+                        )
             if isinstance(result, tuple) and len(result) == 3:
                 h, p_ids, att = result
             else:
@@ -681,11 +744,12 @@ def wsserver():
         loop.close()
 
 async def swarm_discover(sock):
-    global MODEL, NETWORK_TOPOLOGY, SHARDING_SERVICE
+    global MODEL, MODEL_LOCK, NETWORK_TOPOLOGY, SHARDING_SERVICE
 
     threading.Thread(target=listen, args=(sock,)).start()
     threading.Thread(target=update_network).start()
     threading.Thread(target=wsserver).start()
+    threading.Thread(target=layer_consumer, args=(LOAD_LAYER_QUEUE,)).start()
     
     while True:
         if SHARDING_SERVICE:
@@ -697,8 +761,6 @@ async def swarm_discover(sock):
             await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
             break
         time.sleep(1)
-    
-
 
 async def main():
     await swarm_discover(sock)
