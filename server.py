@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from util import SELECTED_MODEL
+
 def get_outbound_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -50,7 +52,7 @@ PEER_PORT = 5005          # Change to the peer's port
 ACTIVE_HOSTS = []
 MASTER_NODE = True
 MASTER_NODE_IP: str = None
-SELECTED_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+
 
 START_TIME = time.perf_counter()
 WAIT_TIME = 10

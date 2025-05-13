@@ -11,3 +11,5 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("rich")
+
+SELECTED_MODEL = "meta-llama/Llama-3.2-1B-Instruct"

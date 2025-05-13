@@ -8,6 +8,10 @@ from torch import nn
 from dataclasses import dataclass
 from util import log
 import gc
+from dotenv import load_dotenv
+load_dotenv()
+
+from util import SELECTED_MODEL
 
 # utils
 
@@ -47,14 +51,13 @@ def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
 
 # Define paths and device
 model_path = "./model.safetensors"
-tokenizer_path = "meta-llama/Llama-3.2-1B-Instruct"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load the tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
-    tokenizer_path,
+    SELECTED_MODEL,
     use_fast=False,
-    token="your_huggingface_token"  # Replace with your Hugging Face token
+    token=os.getenv('HF_TOKEN')  # Replace with your Hugging Face token
 )
 @dataclass
 class Shard:
