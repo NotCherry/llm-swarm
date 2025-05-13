@@ -218,15 +218,14 @@ def layers_size(metadata) -> Dict[str, int]:
                 continue
             d[key] = s         
     
-    # if "lm_head.weight" not in d.keys():
-    #     d["lm_head.weight"] = d["model.embed_tokens.weight"]
+    if "lm_head.weight" not in d.keys():
+        d["lm_head.weight"] = d["model.embed_tokens.weight"]
     return d
         
 
 async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
     global NETWORK_TOPOLOGY
     nodes = sorted(NETWORK_TOPOLOGY.nodes.items(), key=lambda x: x[1].spec.ram)
-    # n_layers = len(set([ l.split(".")[2] for l in layer_dict.keys() if "layer"]))
     start_layer = 0
     current_layer = 0
 
@@ -599,7 +598,6 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
     NETWORK_TOPOLOGY.loading_model = False                
     NETWORK_TOPOLOGY.loaded_model = True
     log.info(f"Download of model {SELECTED_MODEL} completed")
-    await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
     
 
 
@@ -691,21 +689,14 @@ async def swarm_discover(sock):
         if SHARDING_SERVICE:
             threading.Thread(target=plan_network, args=()).start()
             break
-   
-    while True:
         time.sleep(1)
-        if local_address in NETWORK_TOPOLOGY.nodes.keys():
-            if NETWORK_TOPOLOGY.nodes[local_address].shard is not None:
-                break
-    # shard1 = Shard("LLAMA-3.2-1B", 0, 15, 16, True)
-    NETWORK_TOPOLOGY.nodes[local_address].shard.loaded = True
-    log.error(f'{NETWORK_TOPOLOGY.nodes[local_address].shard}')
-    MODEL = build_transformer(".", NETWORK_TOPOLOGY.nodes[local_address].shard)
+    while True:
+        if MASTER_NODE and NETWORK_TOPOLOGY.loaded_model and not NETWORK_TOPOLOGY.generating:
+            await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
+            break
+        time.sleep(1)
+    
 
-    await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
-
-
-   
 
 async def main():
     await swarm_discover(sock)
