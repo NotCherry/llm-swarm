@@ -693,7 +693,7 @@ async def swarm_discover(sock):
             break
         time.sleep(1)
     while True:
-        if MASTER_NODE and not NETWORK_TOPOLOGY.generating:
+        if MASTER_NODE and NETWORK_TOPOLOGY.loaded_model and not NETWORK_TOPOLOGY.generating:
             await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
             break
         time.sleep(1)
