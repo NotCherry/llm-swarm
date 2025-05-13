@@ -80,8 +80,9 @@ class Node(BaseModel):
 @dataclass
 class NetworkConfig():
     nodes: Dict[str, Node]
-    lading_model: bool = False
+    loading_model: bool = False
     loaded_model: bool = False
+    generating: bool = False
 
 
 NETWORK_TOPOLOGY = NetworkConfig(nodes={})
@@ -201,7 +202,7 @@ def layers_size(metadata) -> Dict[str, int]:
                     layer_size += s
                 continue
             d[layer[0]] = s             
-        return d
+
     else:
         for key, layer in metadata.items():
 
@@ -216,7 +217,10 @@ def layers_size(metadata) -> Dict[str, int]:
                     layer_size += s
                 continue
             d[key] = s         
-        return d
+    
+    # if "lm_head.weight" not in d.keys():
+    #     d["lm_head.weight"] = d["model.embed_tokens.weight"]
+    return d
         
 
 async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
@@ -236,7 +240,10 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
         if len(layer_dict.keys()) <= 0:
             break
         
-        mem = node.spec.ram
+        mem = node.spec.ram 
+        if node.spec.ram_type != "VRAM":
+            mem -= (200 * 1024 * 1024)
+
         if current_layer == 0:
             mem -= layer_dict['model.embed_tokens.weight']
             del layer_dict['model.embed_tokens.weight']
@@ -347,7 +354,7 @@ async def shard_planner():
         current_checksum = DictChecksumTracker(NETWORK_TOPOLOGY.nodes)._checksum
         if NETWORK_CHECKSUM is not None or NETWORK_CHECKSUM == current_checksum:
             return
-        if NETWORK_TOPOLOGY.lading_model:
+        if NETWORK_TOPOLOGY.loading_model or NETWORK_TOPOLOGY.generating:
             return
         
         url = f"https://huggingface.co/{SELECTED_MODEL}/resolve/main/model.safetensors"
@@ -380,7 +387,7 @@ async def shard_planner():
 
             if model_size > total_memory:
                 log.error("It is never enough MEMEORY!!!!")
-                log.error(f"{model_size}-{total_memory}")
+                log.error(f"Model size: {model_size} -  Available: {total_memory}")
                 return
             
             await run_it(layers_dict)
@@ -423,6 +430,7 @@ def update_network():
         log.info(f"Discovering hosts on: {local_address}.0")
         for host in SEARCH_IP_RANGE:
             sock.sendto(connect_bytes, (host, PEER_PORT))
+        time.sleep(4)
         log.info("Discovery end hosts found:")
         log.info(ACTIVE_HOSTS)    
     
@@ -437,7 +445,9 @@ def update_network():
                 SHARDING_SERVICE = True
     
     time.sleep(5)
+    time_start = None
     while True:
+        time_start = time.perf_counter()
         master_node()
         log.info(f"Node Type {'Master' if MASTER_NODE else 'Worker'}")
         ACTIVE_HOSTS = []
@@ -447,7 +457,7 @@ def update_network():
             for key in keys:
                 if key not in ACTIVE_HOSTS:
                     del NETWORK_TOPOLOGY.nodes[key]
-        time.sleep(5)
+        time.sleep(7 - (time.perf_counter() - time_start))
 
 def convert_and_sort_by_offset(metadata):
     # Convert dict to list of (key, value) tuples
@@ -489,12 +499,12 @@ async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
     MODEL.load_state_dict(state_dict, strict=False)
 
 # co wtedy gdy podczas pobierania dla danej konfiguracji node zostanie wyłączony
-# co gdy pojawią się nowę podczas pobierania ? dodatakowo przy wspieraniu FSDP?
+# co gdy pojawią się nowę podczas pobierania ? dodatkowo przy wspieraniu FSDP?
 
 async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*10):
     global NETWORK_TOPOLOGY, local_address
 
-    NETWORK_TOPOLOGY.lading_model = True
+    NETWORK_TOPOLOGY.loading_model = True
     NETWORK_TOPOLOGY.loaded_model = False
     # Set headers with Hugging Face token if provided
     headers = {}
@@ -586,7 +596,7 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
                         last_buffer_pointer = 0
                         buffer_pointer = 0
             
-    NETWORK_TOPOLOGY.lading_model = False                
+    NETWORK_TOPOLOGY.loading_model = False                
     NETWORK_TOPOLOGY.loaded_model = True
     log.info(f"Download of model {SELECTED_MODEL} completed")
     await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
@@ -613,6 +623,8 @@ async def comunicate(websocket):
             log.info(f"Chat output: \n {message['data']}")    
         if message['type'] == "gen":
             ## GEN
+            NETWORK_TOPOLOGY.generating = True
+
             n = NETWORK_TOPOLOGY.nodes[local_address] 
             first_layer = n.shard.is_first_layer()
             last_layer = n.shard.is_last_layer()            
@@ -637,6 +649,7 @@ async def comunicate(websocket):
             
             # if last layer returned is bool teling if continue
             if isinstance(output, bool) and not output:
+                NETWORK_TOPOLOGY.generating = False
                 return
             
             # the loop not ended run next iter
@@ -644,7 +657,6 @@ async def comunicate(websocket):
             await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : output }})
 
             # retun user the respone
-            log.error(f"{local_address} {MASTER_NODE_IP}")
             if local_address != MASTER_NODE_IP:
                 await brodcast_data_to_node(node_ip=MASTER_NODE_IP, data={"type": "llm-decode", "data": output})
             else:

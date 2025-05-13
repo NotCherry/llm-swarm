@@ -364,7 +364,6 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
                     layer_data['data_offsets'][0]
                 data = f.read(size)
                 t = torch.frombuffer(data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
-                del data
                 layer_weights[k] = t
     f.close()
     dct = remap_dict(layer_weights)
@@ -461,13 +460,13 @@ def model_generate_text(
         generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
         
         decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print(decoded_output)
+        # print(decoded_output)
         if next_token_id.item() == end_token_id:
             # assert False, "implement Brodcast end to masternode "
             return False
 
         decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print("Output:", decoded_output)
+        # print("Output:", decoded_output)
         return decoded_output
 
 
@@ -534,7 +533,7 @@ if __name__ == '__main__':
             generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
             
             decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-            print(decoded_output)
+            # print(decoded_output)
             if next_token_id.item() == end_token_id:
                 break
 
