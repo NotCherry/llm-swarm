@@ -6,10 +6,10 @@ import torch
 from torch import nn
 from dataclasses import dataclass
 from model_configs import LLAMA_3_2_CONFIGS
-from util import log
+from src.util import log
 import gc
 from transformers import AutoTokenizer
-from util import SELECTED_MODEL
+from src.util import SELECTED_MODEL
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -299,60 +299,101 @@ def remap_dict(state_dict):
 
 
 def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tensor, int, dict[str, Any]]:
-
-
-    if not ".safetensors" in str(fn):
+    # Ensure the file path ends with '.safetensors'
+    if ".safetensors" not in str(fn):
         fn = f"{fn}/model.safetensors"
     
-    log.info(f"Loading {fn}")  
-    if (os.path.exists(fn)):
+    log.info(f"Loading {fn}")
+    
+    # Check if file exists and read metadata
+    if os.path.exists(fn):
         f = open(fn, "rb")
+        # Read the first 8 bytes to get the size of metadata
         size = f.read(8)
         data_start = int.from_bytes(size, "little")
+        # Read metadata content
         raw_data = f.read(data_start)
         data_start += 8
+        # Return file handle, starting position, and decoded metadata
         return f, data_start, json.loads(raw_data.decode('utf-8'))
     
+    # Raise error if file is not found
     raise ValueError(f"File {fn} not found")
-    # assert "model.safetensors" not in str(t), "Model path should not contain model.safetensors"
 
-def safe_load_metadata_multifile(fn: Union[str, pathlib.Path], l) -> tuple[torch.Tensor, int, dict[str, Any], bool]:
 
-    weight_map = json.load(open(fn, "r"))['weight_map']
-    layers_files = []
-    for k, v in weight_map.items():
-        if l in k:
-            layers_files.append(v)
-    if len(set(layers_files)) > 1:
-        return *safe_load_metadata_single( f"{fn[:-28]}/{layers_files[0]}"), False
+def safe_load_metadata_multifile(fn: Union[str, pathlib.Path], layer: str) -> tuple[torch.Tensor, int, dict[str, Any], bool]:
+    with open(fn, "r") as f:
+        weight_map = json.load(f)['weight_map']
+    
+    # Find files associated with the specified layer
+    layer_files = [v for k, v in weight_map.items() if layer in k]
+    
+    # Determine base path for the file
+    base_path = fn[:-28]  # Remove last 28 characters to get base directory
+    target_file = f"{base_path}/{layer_files[0]}" if layer_files else None
+    
+    # Check if there are multiple unique files for the layer
+    if len(set(layer_files)) > 1:
+        return *safe_load_metadata_single(target_file), False
+    
+    return *safe_load_metadata_single(target_file), True
 
-    return *safe_load_metadata_single( f"{fn[:-28]}/{layers_files[0]}"), True
 
-def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{layer_index}."):
+def safe_load_by_layer(model_path: str, layer_index: int = -1, layer_prefix: str = "model.layers.{layer_index}.") -> dict:
+    """
+    Load weights for a specific layer from a model file or multi-file setup.
+    
+    Args:
+        model_path (str): Path to the model directory or file.
+        layer_index (int, optional): Index of the layer to load. Defaults to -1 (all layers).
+        layer_prefix (str, optional): Prefix pattern for layer naming. Defaults to "model.layers.{layer_index}."
+    
+    Returns:
+        dict: Dictionary of remapped layer weights.
+    """
+    # Format the layer prefix if a specific layer index is provided
     if layer_index >= 0:
-        l = l.format(layer_index=layer_index)
+        layer_prefix = layer_prefix.format(layer_index=layer_index)
 
+    # Determine the path to the index file for multi-file models
+    index_file = f"{model_path}/model.safetensors.index.json"
+    
+    # Load metadata based on whether it's a single file or multi-file setup
+    if os.path.exists(index_file):
+        file_handle, data_start, metadata, loaded_all = safe_load_metadata_multifile(index_file, layer_prefix)
+    else:
+        file_handle, data_start, metadata, loaded_all = (*safe_load_metadata_single(model_path), True)
 
-    fn = f"{model_path}/model.safetensors.index.json"
-    layer_weights = {}
-    f, data_start, metadata, loaded_all = (*safe_load_metadata_single(model_path), True)  if not os.path.exists(fn) else  safe_load_metadata_multifile(fn, l)
-    last_layer = ""
+    # If not all layers are loaded, define the prefix for the previous layer
+    last_layer_prefix = ""
     if not loaded_all:
-        last_layer = f"models.layers.{layer_index - 1}"
-    for k in metadata.keys():
-            if l in k or (not loaded_all and last_layer in k):
-                log.info(k)
-                layer_data = metadata[k]
-                f.seek(data_start + (layer_data['data_offsets'][0]))
-                size = layer_data['data_offsets'][1] - \
-                    layer_data['data_offsets'][0]
-                data = f.read(size)
-                t = torch.frombuffer(data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
-                layer_weights[k] = t
-    f.close()
-    dct = remap_dict(layer_weights)
+        last_layer_prefix = f"model.layers.{layer_index - 1}"
 
-    return dct
+    # Dictionary to store layer weights
+    layer_weights = {}
+    
+    # Iterate through metadata keys to load relevant layer data
+    for key in metadata.keys():
+        if layer_prefix in key or (not loaded_all and last_layer_prefix in key):
+            log.info(f"Loading weights for {key}")
+            layer_data = metadata[key]
+            
+            # Seek to the starting position of the data in the file
+            file_handle.seek(data_start + layer_data['data_offsets'][0])
+            # Calculate the size of the data to read
+            data_size = layer_data['data_offsets'][1] - layer_data['data_offsets'][0]
+            # Read the raw data
+            raw_data = file_handle.read(data_size)
+            # Convert raw data to a tensor with the specified dtype and shape
+            tensor = torch.frombuffer(raw_data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
+            layer_weights[key] = tensor
+
+    # Close the file handle to free resources
+    file_handle.close()
+    
+    # Remap the dictionary of weights before returning
+    remapped_weights = remap_dict(layer_weights)
+    return remapped_weights
 
 def safe_load_layer(layer_name: str, layer_dtype: str, layer_shape, data):
     layer_weights = {
@@ -366,7 +407,7 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
     loaded_keys = []
 
     if model.shard.start_layer == 0:
-        weights = safe_load_by_layer(model_path, l="model.embed_tokens")
+        weights = safe_load_by_layer(model_path, layer_prefix="model.embed_tokens")
         loaded_keys = loaded_keys + list(weights.keys())
         model.load_state_dict(weights, strict=False)
 
@@ -376,13 +417,13 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
         model.load_state_dict(weights, strict=False)
 
     if model.shard.is_last_layer():
-        weights = safe_load_by_layer(model_path, l="model.norm")
+        weights = safe_load_by_layer(model_path, layer_prefix="model.norm")
         loaded_keys = loaded_keys + list(weights.keys())
         model.load_state_dict(weights, strict=False)     
         
-        weights = safe_load_by_layer(model_path, l="output.weight")
+        weights = safe_load_by_layer(model_path, layer_prefix="output.weight")
         if len(weights.keys()) < 1 and "lm_head.weight" not in loaded_keys:
-            weights = safe_load_by_layer(model_path, l="model.embed_tokens")
+            weights = safe_load_by_layer(model_path, layer_prefix="model.embed_tokens")
             weights['lm_head.weight'] = weights['model.embed_tokens.weight']
             loaded_keys = loaded_keys + ['lm_head.weight']
         model.load_state_dict(weights, strict=False)

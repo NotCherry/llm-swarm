@@ -1,4 +1,6 @@
+import copy
 import json
+from multiprocessing import Process
 import socket
 import struct
 import threading
@@ -8,11 +10,11 @@ from typing import Dict, List, Literal, Optional, Union
 import time
 from dataclasses import asdict, dataclass 
 import requests
-from ptcode import Shard, build_transformer, safe_load_layer, LlamaModel, model_generate_text
+from src.ptcode import Shard, safe_load_by_layer, safe_load_layer, LlamaModel, model_generate_text, safe_load_metadata_single
 import psutil
 import torch
 from benchmarks import get_flops
-from util import log
+from src.util import log
 from tqdm.rich import tqdm
 import os
 from websockets.asyncio.server import serve
@@ -23,23 +25,11 @@ from dotenv import load_dotenv
 from safetensors.torch import save_file
 from accelerate import init_empty_weights
 import re
+import glob
+
 load_dotenv()
 
-from util import SELECTED_MODEL
-
-def get_outbound_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Doesn't need to actually send data; just triggers routing logic
-        s.connect(('1.1.1.1', 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = None
-    finally:
-        s.close()
-
-    log.info(f"IP with access to internet: {ip}")    
-    return ip
+from src.util import SELECTED_MODEL, get_outbound_ip
 
 
 LISTEN_IP = '0.0.0.0'     # Listen on all interfaces
@@ -80,6 +70,8 @@ class Node(BaseModel):
     spec: Dict[str,DeviceSpec]
     shard: Optional[Shard] = None
     next_node_ip: Optional[str] = None
+    loaded_layers: List[str] = []
+    saved_layers: dict[str, List[str]] = {}
     def to_tuple(self):
         """Convert Node to a tuple for checksum computation."""
         return (self.ip, self.spec)
@@ -90,6 +82,11 @@ class NetworkConfig():
     loading_model: bool = False
     loaded_model: bool = False
     generating: bool = False
+    update_time: int = time.time()
+
+    def __setattr__(self, name, value):
+        super().__setattr__("update_time", time.time())
+        super().__setattr__(name, value)
 
 
 NETWORK_TOPOLOGY = NetworkConfig(nodes={})
@@ -111,6 +108,18 @@ def deserialize_network_config(json_str: str) -> NetworkConfig:
     # Convert node dicts back to Node objects
     nodes = {key: Node(**node_data) for key, node_data in config_dict["nodes"].items()}
     return NetworkConfig(nodes=nodes)
+
+def deserialize_network_config(json_str: str) -> NetworkConfig:
+    # Parse JSON string to dict
+    config_dict = json.loads(json_str)
+    # Convert nodes dict to Node objects
+    nodes = {
+        key: Node(**node_data)
+        for key, node_data in config_dict["nodes"].items()
+    }
+    # Create NetworkConfig with deserialized nodes
+    return NetworkConfig(nodes=nodes)
+
 
 def detect_device():
     memory = psutil.virtual_memory()
@@ -136,43 +145,13 @@ def detect_device():
         )
     return spec    
 
-@dataclass
-class UDPMsg:
-    msg: str
-    data: Dict
 
-def listen(sock):
-    global ACTIVE_HOSTS, START_TIME, MASTER_NODE, MASTER_NODE_IP, NETWORK_TOPOLOGY
-    
-    while True:
-        data, addr = sock.recvfrom(1024)
-        data:UDPMsg = json.loads(data.decode('utf-8'))
-        
-        if data['msg']  == "connect":
-            # spec =  DeviceSpec(**json.loads(data['data']))
-            data_dict = json.loads(data["data"])
 
-            # Step 2: Reconstruct DeviceSpec objects
-            spec: dict[str, DeviceSpec] = {
-                key: DeviceSpec.model_validate(value) for key, value in data_dict.items()
-            }
-            if addr[0] not in ACTIVE_HOSTS:
-                ACTIVE_HOSTS.append(addr[0])
-            if addr[0] not in NETWORK_TOPOLOGY.nodes.keys():
-                NETWORK_TOPOLOGY.nodes[addr[0]] = Node(ip=addr[0], spec=spec)
-                log.error(f"Node INIT {NETWORK_TOPOLOGY.nodes[addr[0]]}")
-            elif spec !=  NETWORK_TOPOLOGY.nodes[addr[0]].spec:
-                NETWORK_TOPOLOGY.nodes[addr[0]].spec = spec
-        if data['msg'] == "MASTERNODE" and ((START_TIME + WAIT_TIME) > time.perf_counter()):
-            log.info(f"Master node address: {addr[0]}")
-            # maby we can just append it to the node struct?
-            MASTER_NODE = False
-            MASTER_NODE_IP = addr[0]
-            # TODO Handle case when masternode Disapear
-        if data['msg']  == "net_config":
-            with NETWORK_LOCK:
-                NETWORK_TOPOLOGY.nodes =  deserialize_network_config(data["data"]).nodes
-                log.error(f"config recived {NETWORK_TOPOLOGY.nodes}")
+def get_model_filename():
+    global SELECTED_MODEL
+    return SELECTED_MODEL.replace("/","-")
+
+
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
@@ -382,7 +361,7 @@ def get_model_metadata(url, meta_folder="meta"):
         if url not in data.keys():
             meta = download(url)
             if meta != None:
-                fn_meta = f"{SELECTED_MODEL.replace("/","-")}.json"
+                fn_meta = f"{get_model_filename()}.json"
                 data[url] = fn_meta
                 f.write(json.dumps(data))
                 if not os.path.exists(meta_folder):
@@ -404,8 +383,41 @@ def plan_network():
     finally:
         loop.close()
 
+def veryfy_local_keys(folder_path="."):
+    global NETWORK_TOPOLOGY
+    try:
+        # Ensure the folder exists
+        if not os.path.isdir(folder_path):
+            raise ValueError(f"The folder '{folder_path}' does not exist or is not a directory.")
+
+        # Get list of all *.safetensors files
+        safetensors_files = glob.glob(os.path.join(folder_path, "*.safetensors"))
+        
+        # Check if any files were found
+        if not safetensors_files:
+            print(f"No *.safetensors files found in '{folder_path}'.")
+            return
+
+        # Loop over each file
+        print(f"Found {len(safetensors_files)} *.safetensors files:")
+
+        for file_path in safetensors_files:
+            print(f"Processing: {file_path}")
+            f, data_start, metadata = safe_load_metadata_single(file_path)
+            with NETWORK_LOCK:
+                # if list(metadata.keys()) != NETWORK_TOPOLOGY.nodes[local_address].loaded_layers:
+                #     list(metadata.keys())
+                for l_key in metadata.keys():
+                    if l_key not in NETWORK_TOPOLOGY.nodes[local_address].loaded_layers:
+                        safe_load_by_layer(file_path, layer_prefix=l_key)
+            f.close()
+            
+            
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
 async def shard_planner():
-    global NETWORK_TOPOLOGY, SELECTED_MODEL, NETWORK_TOPOLOGY, NETWORK_CHECKSUM
+    global NETWORK_TOPOLOGY, SELECTED_MODEL, NETWORK_TOPOLOGY, NETWORK_CHECKSUM,MASTER_NODE
     
     while True:
         time.sleep(5)
@@ -430,6 +442,13 @@ async def shard_planner():
         log.debug(f"GPU nodes: {nodes_with_gpu}")
         log.debug(f"CPU nodes: {nodes_cpu_only}")
 
+        # TODO: asser if current node have moemory to be master node if not set masternode to false and wait for other node to take over
+        # log.error("{}, {}, {}".format(NETWORK_TOPOLOGY.nodes[local_addres].spec['cpu'].ram, (PROGRAM_MINIMAL_SPACE + MASTER_NODE_BUFFER), NETWORK_TOPOLOGY.nodes[local_address].spec['cpu'].ram > (PROGRAM_MINIMAL_SPACE + MASTER_NODE_BUFFER)))
+        if MASTER_NODE and (PROGRAM_MINIMAL_SPACE + MASTER_NODE_BUFFER) > NETWORK_TOPOLOGY.nodes[local_address].spec['cpu'].ram:
+            log.error("Not enough memory available for master node stepping down to worker")
+            MASTER_NODE = False    
+            break
+
         total_memory = 0
         for (key, v) in nodes_with_gpu:
             total_memory += (v.ram - PROGRAM_MINIMAL_SPACE - (MASTER_NODE_BUFFER if key == local_address and MASTER_NODE else 0))
@@ -448,7 +467,9 @@ async def shard_planner():
             await plan_network_from_layers(layers_dict,  end_layer)
 
             NETWORK_CHECKSUM = DictChecksumTracker(NETWORK_TOPOLOGY.nodes)._checksum
-            await download_file_with_metadata(url=url, hf_token=os.getenv('HF_TOKEN'))
+            # await download_file_with_metadata(url=url, hf_token=os.getenv('HF_TOKEN'))
+            log.info("Loading of the models begins")
+            await download_model()
 
         if isinstance(metadata, list) or 'format' in metadata['__metadata__'].keys():
             del metadata["__metadata__"]
@@ -520,6 +541,8 @@ def update_network():
             MASTER_NODE_IP = local_address                
             if not SHARDING_SERVICE:
                 SHARDING_SERVICE = True
+                threading.Thread(target=plan_network, args=()).start()
+            
     
     time.sleep(5)
     time_start = None
@@ -564,7 +587,77 @@ def find_key_of_node_with_layer(topology: NetworkConfig, layer: int) -> Optional
 async def brodcast_data_to_node(node_ip, data):
     async with connect(f"ws://{node_ip}:{WS_PORT}") as websocket:
         await websocket.send(json.dumps(data))
+
+
+def save_local_layers(state_dict):
+    global MODEL, MODEL_LOCK
     
+    with MODEL_LOCK:
+        MODEL.load_state_dict(state_dict, strict=False)
+        node_layer_loaded = {"msg": "node_layer_loaded", "data": list(state_dict.keys())}
+        node_layer_loaded_bytes = json.dumps(node_layer_loaded).encode('utf-8')
+        sock.sendto(node_layer_loaded_bytes, (MASTER_NODE_IP, PEER_PORT))
+        r = [str(x) for x in range(MODEL.shard.start_layer, MODEL.shard.end_layer + 1)]
+        condition1 = all(any(re.search(rf'\.layers\.{layer}\.', s) for s in MODEL.loaded_keys) for layer in r)
+        condition2 = all( layer in MODEL.loaded_keys for layer in  ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"] )
+        if condition1 and condition2:
+            log.info('Saving node weights')
+            fn = f"{get_model_filename}.safetensors"
+            mt = get_model_metadata()
+            if not os.path.exists(fn):
+                st = MODEL.state_dict()
+                dummy_layer = {"dtype": "BF16", "shape": [1000000000000000000], "data_offsets": [1000000000000000000, 1000000000000000000]}
+                # Add missing keys from mt to st with the dummy layer to preallocat metadata to match all layers
+                for i, key in enumerate(mt.keys()):
+                    if key not in st.keys():
+                        st[f"dummy_layer_{i}"] = dummy_layer
+                save_file(st, fn)
+                return
+            
+
+            # mt loaded model metadata | metadata_local - local file metadata
+            # local metadata has dummy_layers
+            mt = get_model_metadata()
+            f, data_start, local_metadata = safe_load_metadata_single(fn)
+            new_local_metadata = copy.deepcopy(local_metadata)
+            last_data_offset = [v for k, v in new_local_metadata.items() if "dummy" not in k and "metadata" not in k][-1]
+             
+            keys_to_add = [key for key in mt if key not in local_metadata]
+
+            # Find dummy keys to remove (up to the number of keys to add)
+            keys_to_remove = [key for key in new_local_metadata if "dummy" in key][:len(keys_to_add)]
+
+            # Update new_local_metadata: add new keys, remove dummy keys
+            new_local_metadata.update({key: mt[key] for key in keys_to_add})
+            for key in keys_to_remove:
+                del new_local_metadata[key]
+            
+
+            # Update data offsets of the new keys:
+            s = 0
+            for k in keys_to_add:
+                s = new_local_metadata[k]['data_offset'][1] - new_local_metadata[k]['data_offset'][0]
+                new_local_metadata[k]['data_offset'] = [last_data_offset, last_data_offset + s]
+                last_data_offset += s
+
+
+            json_bytes = json.dumps(new_local_metadata).encode('utf-8')
+            json_size = len(json_bytes)
+            padding_size = data_start - json_size
+
+            if padding_size < 0:
+                raise ValueError(f"JSON content is too large to fit in {json_size} bytes without newlines.")
+
+            # Create padding
+            padding = b' ' * padding_size
+
+            # Final output
+            final_output = json_bytes + padding
+
+
+            f.seek(8)
+            f.write(final_output)
+
 
 async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
     global NETWORK_TOPOLOGY, local_address, MODEL, MODEL_LOCK
@@ -580,9 +673,272 @@ async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
     if MODEL is None: 
         init_model()
 
-    with MODEL_LOCK:
-        MODEL.load_state_dict(state_dict, strict=False)
+    save_local_layers(state_dict)
 
+
+async def rearrange_layers_in_nodes():
+    global NETWORK_TOPOLOGY, NETWORK_LOCK
+    """
+    The primary goal is to manage a distributed network of nodes, each storing specific model layers 
+    (e.g., Node A stores layers 1, 2, 3; Node B stores layers 4, 5, 6) to execute a machine learning model. 
+    When the network detects a new node, Node C, which is computationally faster than
+    Node A (with Node C > Node A > Node B in terms of speed), the system will copy the layers from the slowest node (Node B in this case) 
+    to Node C. This transfer aims to leverage Node C's superior performance to accelerate model execution.
+
+    Future Considerations:
+
+    The system will account for the network card speed and internet connectivity of nodes. For instance, 
+    if Node B uses a base-1000 (1 Gbps) network interface and Node C uses a base-10G (10 Gbps) interface, 
+    the system will factor in these differences to optimize layer transfers and model performance in future iterations.
+    """
+    layers_missing_in_network = []
+    with NETWORK_LOCK:
+        network_layers = {
+            k: v.saved_layers[SELECTED_MODEL] for k, v in NETWORK_TOPOLOGY.nodes.items()
+            if SELECTED_MODEL in v.saved_layers
+        }
+        network_shards = {
+            k: v.shard for k, v in NETWORK_TOPOLOGY.nodes.items()
+        }
+        for k, v in network_shards.items():
+            # Get the range of layers for this shard (as strings)
+            list_of_layers = [str(x) for x in range(v.start_layer, v.end_layer + 1)]
+            
+            for layer in list_of_layers:
+                # Look for the layer in the current node's loaded layers for SELECTED_MODEL
+                layer_found = False
+                layer_name = None
+                if k in network_layers:
+                    for s in network_layers[k]:
+                        # Check if the layer name contains "layers.<layer>." or "layers.<layer>.<something>"
+                        if re.search(rf'\.layers\.{layer}\b', s):  # \b ensures word boundary
+                            layer_found = True
+                            layer_name = s
+                            break
+                    
+                if layer_found:
+                    # Layer is already loaded on this node, no action needed
+                    continue
+                else:
+                    # Layer not found on this node, search other nodes
+                    target_node = None
+                    for node_key, saved_layers in network_layers.items():
+                        if node_key == k:
+                            continue  # Skip the current node
+                        for s in saved_layers:
+                            if re.search(rf'\.layers\.{layer}\b', s):
+                                target_node = node_key
+                                layer_name = s
+                                break
+                        if target_node:
+                            break
+                    
+                    if target_node:
+                        # Call send_requested_layer with the target node and layer name
+                        await request_layer_from_node(target_node, layer_name)
+                    else:
+                        print(f"Layer {layer} not found on any node for model {SELECTED_MODEL}.")
+                        layers_missing_in_network.append(layer)
+    return layers_missing_in_network
+
+async def request_layer_from_node(target_node, layer_name):
+    await brodcast_data_to_node(NETWORK_TOPOLOGY.nodes[target_node].ip, {"type":"layer_request", "data": layer_name})
+    
+
+def send_requested_layer(target_node, layer_name):
+    # TODO: load layer from file to layerdict()
+    global NETWORK_TOPOLOGY
+    if layer_name in NETWORK_TOPOLOGY.nodes[local_address].loaded_layers:
+       broadcast_layer_to_node(target_node, MODEL.model.state_dict()[layer_name])
+
+    fn = f"{get_model_filename()}.safetensors"
+    
+    if not os.path.exists(fn):
+        log.error("Config is invalig brodcasting sync request")
+        # TODO: send brodcast
+        return
+
+    weights = safe_load_by_layer(fn, layer_prefix=layer_name)
+    broadcast_layer_to_node(target_node, weights)
+
+
+async def download_model():
+    # TODO: afer moving layers to dir
+    global SELECTED_MODEL, NETWORK_TOPOLOGY, local_address
+
+    node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
+    assert node_key == local_address
+
+    NETWORK_TOPOLOGY.loading_model = True
+    NETWORK_TOPOLOGY.loaded_model = False
+    
+    missing_layers = await rearrange_layers_in_nodes()
+
+    if len(missing_layers) == None:
+        return
+    
+    url = f"https://huggingface.co/{SELECTED_MODEL}/resolve/main/model.safetensors.index.json"
+
+    headers = {}
+    headers["Authorization"] = f"Bearer {os.getenv("HF_TOKEN")}"
+    response = requests.get(url, headers=headers)
+    if response.status_code not in (206, 200, 404):
+        raise Exception(f"Failed to fetch metadata: HTTP {response.status_code}")
+    elif  response.status_code != 404:
+        
+        metadata = response.json()['weight_map']
+
+        layers_in_file = {}
+        for l in missing_layers:
+            if l not in metadata:
+                print(f"Warning: Layer '{l}' not found in metadata")
+                continue
+            file_key = metadata[l]
+            if file_key not in layers_in_file:
+                layers_in_file[file_key] = []
+            layers_in_file[file_key].append(l)
+
+        for k, v in layers_in_file.items():
+            url_of_safetensors = f"https://huggingface.co/{SELECTED_MODEL}/resolve/main/{k}"
+            load_safetensors_from_network(url_of_safetensors, missing_layers=v, full_metadata=metadata)
+    else:
+        url_of_safetensors = f"https://huggingface.co/{SELECTED_MODEL}/resolve/main/model.safetensors"
+        await load_safetensors_from_network(url_of_safetensors, missing_layers=missing_layers)
+
+
+    NETWORK_TOPOLOGY.loading_model = False
+    NETWORK_TOPOLOGY.loaded_model = True
+    log.info(f"Download of missing layers for model {SELECTED_MODEL} completed")    
+
+
+async def load_safetensors_from_network(url, missing_layers, hf_token=os.getenv("HF_TOKEN"), chunk_size=1024*1024*10, full_metadata=None):
+    global NETWORK_TOPOLOGY
+    # Set headers with Hugging Face token if provided
+    headers = {}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
+    # Step 1: Fetch header size (first 8 bytes)
+    headers['Range'] = 'bytes=0-7'
+    response = requests.get(url, headers=headers)
+    if response.status_code not in (206, 200):
+        raise Exception(f"Failed to fetch header size: HTTP {response.status_code}")
+    
+    length_of_header = struct.unpack('<Q', response.content)[0]
+
+    # Step 2: Fetch metadata JSON
+    headers['Range'] = f'bytes=8-{7 + length_of_header}'
+    response = requests.get(url, headers=headers)
+    if response.status_code not in (206, 200):
+        raise Exception(f"Failed to fetch metadata: HTTP {response.status_code}")
+    
+    metadata = response.json()
+    if "__metadata__" in metadata:
+        del metadata["__metadata__"]
+
+    # Step 3: Filter layers to download based on missing_layers
+    layers_to_download = [
+        (key, info) for key, info in convert_and_sort_by_offset(metadata)
+        if re.match(r"model\.layers\.(\d+)", key) and re.match(r"model\.layers\.(\d+)", key).group(1) in missing_layers    
+    ]
+
+    if "model.layers.0" in metadata:
+        layers_to_download.append(metadata["model.embed_tokens.weight"])
+
+    last_layer = f"model.layers.{NETWORK_TOPOLOGY.nodes[local_address].shard.n_layers - 1}"
+    if last_layer in layers_to_download:
+        if "lm_head.weight" in metadata:
+            layers_to_download.append(("lm_head.weight", metadata["lm_head.weight"]))
+        elif "output.weight" in metadata:
+            layers_to_download.append(("lm_head.weight", metadata["output.weight"]))
+
+        if full_metadata and "model.embed_tokens.weight" in metadata:
+            if "lm_head.weight" not in full_metadata and "output.weight" not in full_metadata:
+                layers_to_download.append(("lm_head.weight", metadata["model.embed_tokens.weight"]))
+
+
+
+
+    log.error(f"{layers_to_download} == layers_to_download")
+
+    if not layers_to_download:
+        log.info("No missing layers to download")
+        return
+
+    # Calculate total size to download for progress bar
+    total_download_size = sum(
+        info['data_offsets'][1] - info['data_offsets'][0]
+        for _, info in layers_to_download
+    )
+
+    # Initialize buffer and data dictionary
+    data_dict = {}
+    max_layer_size = max(
+        (info['data_offsets'][1] - info['data_offsets'][0])
+        for _, info in layers_to_download
+    ) if layers_to_download else chunk_size
+    buffer = bytearray(max_layer_size)
+
+    # Step 4: Loop over missing layers and download their data ranges
+    with tqdm(total=total_download_size, unit="B") as pbar:
+        for layer_name, layer_info in layers_to_download:
+            start_offset, end_offset = layer_info['data_offsets']
+            range_size = end_offset - start_offset
+
+            # Request specific range for the layer
+            headers['Range'] = f'bytes={start_offset}-{end_offset-1}'
+            response = requests.get(url, headers=headers, stream=True)
+            if response.status_code not in (206, 200):
+                raise Exception(f"Failed to download layer {layer_name}: HTTP {response.status_code}")
+
+            # Process the response
+            buffer_pointer = 0
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    pbar.update(len(chunk))
+                    buffer[buffer_pointer:buffer_pointer + len(chunk)] = chunk
+                    buffer_pointer += len(chunk)
+
+            # Verify downloaded size
+            if buffer_pointer != range_size:
+                log.error(f"Downloaded size {buffer_pointer} for {layer_name} does not match expected {range_size}")
+                continue
+
+            # Store layer data
+            l_data = buffer[:range_size]
+            log.info(f"Downloaded Layer: {layer_name}, Size: {range_size}")
+            data_dict[layer_name] = {"data": l_data, "info": layer_info}
+
+            # Determine node for broadcasting
+            node_key = None
+            l_num = None
+            if "model.layers" in layer_name:
+                l_num = int(layer_name.split('.')[2])
+                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, l_num)
+            elif "model.embed_tokens" in layer_name:
+                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
+            elif "model.norm" in layer_name or "output.weight" in layer_name:
+                last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
+                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+            assert False, f"{node_key}, {l_num}, {layer_name}, {layer_info}"
+            if node_key is None:
+                log.error(f"Failed to find node_key for layer: {layer_name}")
+                continue
+
+            # Broadcast layer to node
+            await broadcast_layer_to_node(node_key, data_dict)
+
+            # Handle special case for embed_tokens
+            if layer_name == "model.embed_tokens.weight" and ("output.weight" not in metadata or "output.weight" not in (full_metadata if full_metadata is not None else "")):
+                data_dict['lm_head.weight'] = data_dict['model.embed_tokens.weight']
+                del data_dict['model.embed_tokens.weight']
+                last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
+                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                await broadcast_layer_to_node(node_key, data_dict)
+
+            # Clear data_dict for next layer
+            data_dict = {}
+            buffer_pointer = 0
 
 async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*10):
     global NETWORK_TOPOLOGY, local_address
@@ -594,19 +950,19 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
     NETWORK_TOPOLOGY.loading_model = True
     NETWORK_TOPOLOGY.loaded_model = False
     # Set headers with Hugging Face token if provided
-    headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
+    # headers = {}
+    # if hf_token:
+    #     headers["Authorization"] = f"Bearer {hf_token}"
     
-    # Get file size for progress bar (if available)
-    response = requests.head(url, headers=headers, allow_redirects=True)
-    file_size = int(response.headers.get("content-length", 0))
+    # # Get file size for progress bar (if available)
+    # response = requests.head(url, headers=headers, allow_redirects=True)
+    # file_size = int(response.headers.get("content-length", 0))
 
-    # Stream the download
-    response = requests.get(url, stream=True, headers=headers)
+    # # Stream the download
+    # response = requests.get(url, stream=True, headers=headers)
     
-    if response.status_code != 200:
-        raise Exception(f"Failed to download: HTTP {response.status_code}")
+    # if response.status_code != 200:
+    #     raise Exception(f"Failed to download: HTTP {response.status_code}")
 
     # Variables for metadata parsing
     header_size = None
@@ -620,96 +976,99 @@ async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*1
     file_size = os.path.getsize("model.safetensors")
 
     with tqdm(total=file_size, unit="B") as pbar:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if chunk:  # Filter out keep-alive chunks
-                pbar.update(len(chunk))
+        with open("model.safetensors", 'rb') as file:  # 'rb' mode for binary reading
+            for chunk in iter(lambda: file.read(chunk_size), b''):
+    # with tqdm(total=file_size, unit="B") as pbar:
+    #     for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:  # Filter out keep-alive chunks
+                    pbar.update(len(chunk))
 
-                buffer_pointer += len(chunk)
-                buffer[last_buffer_pointer:buffer_pointer] = chunk
-                last_buffer_pointer += len(chunk)
-                # Accumulate buffer for metadata parsing
-                # Read header size (first 8 bytes)
-                if header_size is None and len(buffer) >= 8:
-                    header_size = struct.unpack("<Q", buffer[:8])[0]
+                    buffer_pointer += len(chunk)
+                    buffer[last_buffer_pointer:buffer_pointer] = chunk
+                    last_buffer_pointer += len(chunk)
+                    # Accumulate buffer for metadata parsing
+                    # Read header size (first 8 bytes)
+                    if header_size is None and len(buffer) >= 8:
+                        header_size = struct.unpack("<Q", buffer[:8])[0]
 
-                # Read JSON header once we have enough data
-                elif header_size is not None and buffer_pointer >= 8 + header_size and metadata is None:
-                    b = buffer[8:8 + header_size]
-                    header_data = b.decode()
-                    metadata = json.loads(header_data)
-                    del metadata["__metadata__"]
-                
-                    max_layer_size = max([ s for k, s in  layers_size(metadata).items() ])
-                    layers_to_dwonload = convert_and_sort_by_offset(metadata)
+                    # Read JSON header once we have enough data
+                    elif header_size is not None and buffer_pointer >= 8 + header_size and metadata is None:
+                        b = buffer[8:8 + header_size]
+                        header_data = b.decode()
+                        metadata = json.loads(header_data)
+                        del metadata["__metadata__"]
+                    
+                        max_layer_size = max([ s for k, s in  layers_size(metadata).items() ])
+                        layers_to_dwonload = convert_and_sort_by_offset(metadata)
 
-                    buffer_copy = buffer[8 + header_size:]
-                    buffer = bytearray(max_layer_size)
-                    buffer[:len(buffer_copy)] = buffer_copy
+                        buffer_copy = buffer[8 + header_size:]
+                        buffer = bytearray(max_layer_size)
+                        buffer[:len(buffer_copy)] = buffer_copy
 
-                    buffer_pointer = len(buffer_copy)
-                    last_buffer_pointer = len(buffer_copy)
+                        buffer_pointer = len(buffer_copy)
+                        last_buffer_pointer = len(buffer_copy)
 
-                elif metadata is not None:
-                    # Ensure buffer is a bytearray for mutability
-                    if not isinstance(buffer, bytearray):
-                        buffer = bytearray(buffer)
+                    elif metadata is not None:
+                        # Ensure buffer is a bytearray for mutability
+                        if not isinstance(buffer, bytearray):
+                            buffer = bytearray(buffer)
 
-                    while layers_to_dwonload:
-                        # Calculate layer length
-                        layer_info = layers_to_dwonload[0][1]
-                        next_layer_lenght = layer_info['data_offsets'][1] - layer_info['data_offsets'][0]
-                        
-                        # Check if buffer has enough data
-                        if buffer_pointer < next_layer_lenght:
-                            break
+                        while layers_to_dwonload:
+                            # Calculate layer length
+                            layer_info = layers_to_dwonload[0][1]
+                            next_layer_lenght = layer_info['data_offsets'][1] - layer_info['data_offsets'][0]
+                            
+                            # Check if buffer has enough data
+                            if buffer_pointer < next_layer_lenght:
+                                break
 
-                        # Process layer
-                        layer_name = layers_to_dwonload[0][0]
-                        node_key = None
-                        l_num = None
-                        if "model.layers" in layer_name:
-                            l_num = int(layer_name.split('.')[2])
-                            node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, l_num)
-                        elif "model.embed_tokens" in layer_name:
-                            node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
-                        elif "model.norm" in layer_name or "output.weight" in layer_name:
-                            last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
-                            node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
-                        
-                        if node_key is None:
-                            log.error(f"Failed to find node_key for layer: {layer_name}")
-                            break
+                            # Process layer
+                            layer_name = layers_to_dwonload[0][0]
+                            node_key = None
+                            l_num = None
+                            if "model.layers" in layer_name:
+                                l_num = int(layer_name.split('.')[2])
+                                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, l_num)
+                            elif "model.embed_tokens" in layer_name:
+                                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)
+                            elif "model.norm" in layer_name or "output.weight" in layer_name:
+                                last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
+                                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                            
+                            if node_key is None:
+                                log.error(f"Failed to find node_key for layer: {layer_name}")
+                                break
 
-                        # Extract layer data
-                        l_data = buffer[:next_layer_lenght]
-                        log.info(f"Downloaded Layer for node: {node_key}, Name: {layer_name}")
-                        data_dict[layer_name] = {"data": l_data, "info": layer_info}
+                            # Extract layer data
+                            l_data = buffer[:next_layer_lenght]
+                            log.info(f"Downloaded Layer for node: {node_key}, Name: {layer_name}")
+                            data_dict[layer_name] = {"data": l_data, "info": layer_info}
 
-                        # Remove processed layer
-                        del layers_to_dwonload[0]
+                            # Remove processed layer
+                            del layers_to_dwonload[0]
 
-                        # Shift buffer left
-                        buffer[:last_buffer_pointer - next_layer_lenght] = buffer[next_layer_lenght:last_buffer_pointer]
-                        # Zero out the remaining space
-                        buffer[last_buffer_pointer - next_layer_lenght:last_buffer_pointer] = bytes(last_buffer_pointer - next_layer_lenght)
+                            # Shift buffer left
+                            buffer[:last_buffer_pointer - next_layer_lenght] = buffer[next_layer_lenght:last_buffer_pointer]
+                            # Zero out the remaining space
+                            buffer[last_buffer_pointer - next_layer_lenght:last_buffer_pointer] = bytes(last_buffer_pointer - next_layer_lenght)
 
-                        # Update pointers
-                        last_buffer_pointer -= next_layer_lenght
-                        buffer_pointer -= next_layer_lenght
+                            # Update pointers
+                            last_buffer_pointer -= next_layer_lenght
+                            buffer_pointer -= next_layer_lenght
 
-                        # Optional: Check if we need to skip further processing
-                        layers_number_in_queue = set(int(x[0].split(".")[2]) for x in layers_to_dwonload if "model.layers" in x[0])
-                        if l_num is not None and l_num in layers_number_in_queue:
-                            continue
-                        await broadcast_layer_to_node(node_key, data_dict)
-                        if "model.embed_tokens.weight" == layer_name and "output.weight" not in metadata.keys():
-                            data_dict['lm_head.weight'] = data_dict['model.embed_tokens.weight']
-                            del data_dict['model.embed_tokens.weight']
-                            last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
-                            node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                            # Optional: Check if we need to skip further processing
+                            layers_number_in_queue = set(int(x[0].split(".")[2]) for x in layers_to_dwonload if "model.layers" in x[0])
+                            if l_num is not None and l_num in layers_number_in_queue:
+                                continue
                             await broadcast_layer_to_node(node_key, data_dict)
+                            if "model.embed_tokens.weight" == layer_name and "output.weight" not in metadata.keys():
+                                data_dict['lm_head.weight'] = data_dict['model.embed_tokens.weight']
+                                del data_dict['model.embed_tokens.weight']
+                                last_layer = NETWORK_TOPOLOGY.nodes[find_key_of_node_with_layer(NETWORK_TOPOLOGY, 0)].shard.n_layers - 1
+                                node_key = find_key_of_node_with_layer(NETWORK_TOPOLOGY, last_layer)
+                                await broadcast_layer_to_node(node_key, data_dict)
 
-                        data_dict = {}
+                            data_dict = {}
                         
     NETWORK_TOPOLOGY.loading_model = False                
     NETWORK_TOPOLOGY.loaded_model = True
@@ -732,17 +1091,21 @@ async def comunicate(websocket):
     async for message in websocket:
         message = json.loads(message)
         if message['type'] == "layer_data":
-            with MODEL_LOCK:
-                MODEL.load_state_dict(message['data'], strict=False)
+            state_dict = message['data']
+            save_local_layers(state_dict)                  
+        if message['type'] == "layer_request":
+            send_requested_layer(message['data'])
         if message['type'] == "llm-decode":
             log.info(f"Chat output: \n {message['data']}")    
         if message['type'] == "gen":
             ## GEN
             NETWORK_TOPOLOGY.generating = True
             with MODEL_LOCK:
-                # MODEL.to(device= "cude" if "gpu" NETWORK_TOPOLOGY.nodes[local_address].spec.keys() else "cpu")
+                MODEL.to(device= "cude" if "gpu" == NETWORK_TOPOLOGY.nodes[local_address].spec.keys() else "cpu")
                 MODEL.eval()
 
+            while local_address not in NETWORK_TOPOLOGY.nodes.keys():
+                time.sleep(0.001)
             n = NETWORK_TOPOLOGY.nodes[local_address] 
             first_layer = n.shard.is_first_layer()
             last_layer = n.shard.is_last_layer()            
@@ -780,10 +1143,6 @@ async def comunicate(websocket):
             else:
                 log.info(output)
 
-            
-            
-
-
 
 async def WebSocketDataStream():
     async with serve(comunicate, LISTEN_IP, WS_PORT) as server:
@@ -798,19 +1157,21 @@ def wsserver():
     finally:
         loop.close()
 
+
 async def swarm_discover(sock):
     global MODEL, MODEL_LOCK, NETWORK_TOPOLOGY, SHARDING_SERVICE
+    
+    # restore last config
+    net_cfg_path = "net.cfg"
+    if os.path.exists(net_cfg_path):
+        with open(net_cfg_path, "r") as f:
+            with NETWORK_LOCK:
+                NETWORK_TOPOLOGY = deserialize_network_config(f.read())
 
     threading.Thread(target=listen, args=(sock,)).start()
     threading.Thread(target=update_network).start()
     threading.Thread(target=wsserver).start()
     
-    
-    while True:
-        if SHARDING_SERVICE:
-            threading.Thread(target=plan_network, args=()).start()
-            break
-        time.sleep(1)
     while True:
         if MASTER_NODE and NETWORK_TOPOLOGY.loaded_model and not NETWORK_TOPOLOGY.generating:
             await brodcast_data_to_node(node_ip=local_address, data={ "type":"gen", "data": { "prompt" : " Hi my name is bryan" }})
