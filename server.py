@@ -1,5 +1,4 @@
 import json
-from queue import Queue
 import socket
 import struct
 import threading
@@ -62,22 +61,8 @@ WAIT_TIME = 10
 SHARDING_SERVICE = False
 METADATA_STORE: Dict[str, str] = {}
 
-LOAD_LAYER_QUEUE = Queue()
 MODEL: LlamaModel = None
 MODEL_LOCK = threading.Lock()
-
-def layer_consumer(queue):
-    global MODEL 
-    while True:
-        item = LOAD_LAYER_QUEUE.get()  # Get item from queue (blocks if empty)
-        if item is None:
-            queue.task_done()
-            break
-        with MODEL_LOCK:
-            MODEL.load_state_dict(item, strict=False)
-            
-        print(f'Layer loaded')
-        queue.task_done()  # Mark task as done
 
 
 class DeviceSpec(BaseModel):
@@ -205,7 +190,6 @@ class DictChecksumTracker:
 
 def layers_size(metadata) -> Dict[str, int]:
     d = {}
-    # TODO: sum layer begining with model.layers.{i}
     layer_size = 0
     layer_number = 0
     
@@ -520,14 +504,10 @@ async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
         return
     if MODEL is None: 
         init_model()
-    # LOAD_LAYER_QUEUE.put(state_dict)
+
     with MODEL_LOCK:
         MODEL.load_state_dict(state_dict, strict=False)
 
-
-
-# co wtedy gdy podczas pobierania dla danej konfiguracji node zostanie wyłączony
-# co gdy pojawią się nowę podczas pobierania ? dodatkowo przy wspieraniu FSDP?
 
 async def download_file_with_metadata(url, hf_token=None, chunk_size=1024*1024*10):
     global NETWORK_TOPOLOGY, local_address
@@ -749,7 +729,7 @@ async def swarm_discover(sock):
     threading.Thread(target=listen, args=(sock,)).start()
     threading.Thread(target=update_network).start()
     threading.Thread(target=wsserver).start()
-    threading.Thread(target=layer_consumer, args=(LOAD_LAYER_QUEUE,)).start()
+    
     
     while True:
         if SHARDING_SERVICE:
