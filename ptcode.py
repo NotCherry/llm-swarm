@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer
 from torch import nn
 from dataclasses import dataclass
+from model_configs import LLAMA_3_2_CONFIGS
 from util import log
 import gc
 from dotenv import load_dotenv
@@ -95,21 +96,11 @@ def poll_state(layer):
     return STATE_DATA[layer]
 
 # Define the LLaMA 3.2 1B Instruct model architecture
+
 class LlamaModel(nn.Module):
-    def __init__(self, shard: Shard):
+    def __init__(self, shard: Shard, model_size="1B"):
         super().__init__()
-        self.config = {
-            "hidden_size": 2048,
-            "num_hidden_layers": 16,
-            "num_attention_heads": 32,
-            "intermediate_size": 8192,
-            "vocab_size": 128256,
-            "max_position_embeddings": 4096,
-            "rms_norm_eps": 1e-5,
-            "rope_theta": 500000.0,
-            "num_key_value_heads": 8,
-            "dtype": torch.bfloat16
-        }
+        self.config = LLAMA_3_2_CONFIGS[model_size]
         self.shard = shard
         self.loaded_keys = []
         self.model = nn.ModuleDict()
