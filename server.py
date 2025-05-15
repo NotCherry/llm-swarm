@@ -4,7 +4,7 @@ import struct
 import threading
 import time
 import asyncio
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 import time
 from dataclasses import asdict, dataclass 
 import requests
@@ -21,7 +21,8 @@ import hashlib
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from safetensors.torch import save_file
-
+from accelerate import init_empty_weights
+import re
 load_dotenv()
 
 from util import SELECTED_MODEL
@@ -46,6 +47,8 @@ LISTEN_PORT = 5005        # Port to listen on
 WS_PORT = 8543
 
 local_address = get_outbound_ip()
+PROGRAM_MINIMAL_SPACE = (500 * 1024 * 1024)
+MASTER_NODE_BUFFER = (600 * 1024 * 1024)
 
 SEARCH_IP_RANGE = [f"{".".join(local_address.split(".")[:3])}.{i}" for i in range(1,254) ] # Change to the peer's IP
 PEER_PORT = 5005          # Change to the peer's port
@@ -69,13 +72,12 @@ class DeviceSpec(BaseModel):
     device: Literal["cpu", "cuda"]
     name: str
     ram: int
-    ram_type: Literal["RAM", "VRAM"]
     tflops: float 
 
 
 class Node(BaseModel):
     ip: str
-    spec: DeviceSpec
+    spec: Dict[str,DeviceSpec]
     shard: Optional[Shard] = None
     next_node_ip: Optional[str] = None
     def to_tuple(self):
@@ -111,23 +113,28 @@ def deserialize_network_config(json_str: str) -> NetworkConfig:
     return NetworkConfig(nodes=nodes)
 
 def detect_device():
-    if torch.cuda.is_available():
-        return DeviceSpec(
-            device="cuda",
-            name=torch.cuda.get_device_name(torch.cuda.current_device()),
-            ram=torch.cuda.mem_get_info()[0],
-            ram_type="VRAM",
-            tflops=get_flops()
-        )
-    
     memory = psutil.virtual_memory()
-    return DeviceSpec(
+
+    spec = {
+  
+        "cpu" :
+        DeviceSpec(
         device="cpu",
         name="cpu",
         ram=memory.available,
         ram_type="RAM",
         tflops=0
     )
+    }
+    if torch.cuda.is_available():
+        spec["gpu"] =  DeviceSpec( 
+            device="cuda",
+            name=torch.cuda.get_device_name(torch.cuda.current_device()),
+            ram=torch.cuda.mem_get_info()[0],
+            ram_type="VRAM",
+            tflops=get_flops()
+        )
+    return spec    
 
 @dataclass
 class UDPMsg:
@@ -142,7 +149,13 @@ def listen(sock):
         data:UDPMsg = json.loads(data.decode('utf-8'))
         
         if data['msg']  == "connect":
-            spec = DeviceSpec(**json.loads(data['data']))
+            # spec =  DeviceSpec(**json.loads(data['data']))
+            data_dict = json.loads(data["data"])
+
+            # Step 2: Reconstruct DeviceSpec objects
+            spec: dict[str, DeviceSpec] = {
+                key: DeviceSpec.model_validate(value) for key, value in data_dict.items()
+            }
             if addr[0] not in ACTIVE_HOSTS:
                 ACTIVE_HOSTS.append(addr[0])
             if addr[0] not in NETWORK_TOPOLOGY.nodes.keys():
@@ -188,103 +201,147 @@ class DictChecksumTracker:
         """Update the stored checksum to the current state."""
         self._checksum = self._compute_checksum()
 
-def layers_size(metadata) -> Dict[str, int]:
-    d = {}
+def layers_size(metadata: Union[list, dict]) -> Dict[str, int]:
+    sizes = {}
     layer_size = 0
-    layer_number = 0
-    
-    if isinstance(metadata, list):
-        for layer in metadata:
-            s = layer[1]['data_offsets'][1] - layer[1]['data_offsets'][0]
-            if "model.layers" in layer[0]:
-                l_number = int(layer[1].split('.')[2])
-                if layer_number != l_number:
-                    d[f"model.layers.{l_number}"] = layer_size
-                    layer_size = 0
-                    layer_number = l_number
-                else:
-                    layer_size += s
-                continue
-            d[layer[0]] = s             
+    current_layer = -1
 
+    def process_layer(key: str, size: int):
+        nonlocal layer_size, current_layer
+        layer_match = re.match(r"model\.layers\.(\d+)", key)
+        if layer_match:
+            layer_num = int(layer_match.group(1))
+            if layer_num != current_layer:
+                if current_layer != -1:
+                    sizes[f"model.layers.{current_layer}"] = layer_size
+                layer_size = size
+                current_layer = layer_num
+            else:
+                layer_size += size
+        else:
+            sizes[key] = size
+
+    if isinstance(metadata, list):
+        for key, layer in metadata:
+            size = layer['data_offsets'][1] - layer['data_offsets'][0]
+            process_layer(key, size)
     else:
+        if '__metadata__' in metadata:
+            del metadata['__metadata__']
         for key, layer in metadata.items():
-            s = layer['data_offsets'][1] - layer['data_offsets'][0]
-            if "model.layers" in key:
-                l_number = int(key.split('.')[2])
-                if layer_number != l_number:
-                    d[f"model.layers.{l_number}"] = layer_size
-                    layer_size = 0
-                    layer_number = l_number
-                else:
-                    layer_size += s
-                continue
-            d[key] = s         
-    
-   
-    return d
+            size = layer['data_offsets'][1] - layer['data_offsets'][0]
+            process_layer(key, size)
+
+    # Add the last layer's size
+    if current_layer != -1:
+        sizes[f"model.layers.{current_layer}"] = layer_size
+
+    return sizes
         
+def separate_nodes():
+    global NETWORK_TOPOLOGY
+    # Nodes with GPU devices
+    nodes_with_gpu: Dict[str, DeviceSpec] = {
+        k: v.spec['gpu'] for k, v in NETWORK_TOPOLOGY.nodes.items() if "gpu" in v.spec
+    }
+    
+    # Nodes with CPU devices but no GPU
+    nodes_cpu_only: Dict[str, DeviceSpec] = {
+        k: v.spec['cpu'] for k, v in NETWORK_TOPOLOGY.nodes.items() if "cpu" in v.spec and "gpu" not in v.spec
+    }
+
+    return (
+        sorted(nodes_with_gpu.items(), key=lambda x: x[1].ram, reverse=True),
+        sorted(nodes_cpu_only.items(), key=lambda x: x[1].ram, reverse=True)
+    )
+
+def get_last_layer_number(metadata: Dict[str, any]) -> int:
+    layer_numbers = [
+        int(x.split(".")[2])
+        for x in metadata.keys()
+        if "layer" in x.lower() and len(x.split(".")) > 2 and x.split(".")[2].isdigit()
+    ]
+    if not layer_numbers:
+        raise ValueError("No valid layer keys found in metadata")
+    return max(layer_numbers)
+
 
 async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
-    global NETWORK_TOPOLOGY
-    nodes = sorted(NETWORK_TOPOLOGY.nodes.items(), key=lambda x: x[1].spec.ram)
-    start_layer = 0
-    current_layer = 0
+    global NETWORK_TOPOLOGY, local_address, MASTER_NODE_BUFFER
 
-    # if the network has capasity to load the entire model then te last layer do not need to be accounted
-    if "lm_head.weight" in layer_dict.keys(): del layer_dict['lm_head.weight']
-    if "model.norm.weight" in layer_dict.keys(): del layer_dict['model.norm.weight']
+    # Get model metadata and set buffer
+    url = f"https://huggingface.co/{SELECTED_MODEL}/resolve/main/model.safetensors"
+    metadata = get_model_metadata(url)
+    last_layer_number = get_last_layer_number(metadata)
+    MASTER_NODE_BUFFER = max(layers_size(metadata).values())
 
+    # Remove unnecessary layers
+    for key in ["lm_head.weight", "model.norm.weight"]:
+        layer_dict.pop(key, None)
+
+    nodes_with_gpu, nodes_cpu_only = separate_nodes()
+    current_layer = start_layer = 0
     last_node_ip = None
-    
-    for key, node in nodes:
-        if len(layer_dict.keys()) <= 0:
-            break
-        
-        mem = node.spec.ram 
-        if node.spec.ram_type != "VRAM":
-            mem -= (200 * 1024 * 1024)
 
-        if current_layer == 0:
-            mem -= layer_dict['model.embed_tokens.weight']
-            del layer_dict['model.embed_tokens.weight']
-
-        
-        keys_to_remove = []
-        log.debug(f"Node memory:{mem}")
-        sorted_layers = sorted(layer_dict.items(), key=lambda x: int(x[0].split(".")[2]))
-        for k, layer_size in sorted_layers:
-            if "layer" in k and mem - layer_size > 0:
-                current_layer += 1
-                keys_to_remove.append(k)
-            else:
-                # Create shard for previous layers
-                if last_node_ip != None:
-                    NETWORK_TOPOLOGY.nodes[key].next_node_ip = last_node_ip
-                shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers + 1, False)
-                NETWORK_TOPOLOGY.nodes[key].shard = shard
-                start_layer = current_layer
-                last_node_ip = key
+    def process_nodes(nodes):
+        nonlocal current_layer, start_layer, last_node_ip
+        for node_id, spec in nodes:
+            if not layer_dict:
                 break
 
-        # Handle case where all layers fit in memory
-        if current_layer > start_layer and sorted_layers and "layer" in sorted_layers[-1][0]:
-            shard = Shard(SELECTED_MODEL, start_layer, current_layer, n_layers + 1, False)
-            NETWORK_TOPOLOGY.nodes[key].shard = shard
+            # Check if node has enough memory
+            if spec.ram <= PROGRAM_MINIMAL_SPACE:
+                continue
+            if node_id == local_address and MASTER_NODE and spec.ram < MASTER_NODE_BUFFER + PROGRAM_MINIMAL_SPACE:
+                continue
 
-        for k in keys_to_remove:
-            del layer_dict[k]
+            mem = spec.ram - (MASTER_NODE_BUFFER + PROGRAM_MINIMAL_SPACE if node_id == local_address else 0)
 
-    net_config_msg = {
-        "msg": "net_config",
-        "data": serialize_network_config(NETWORK_TOPOLOGY)
-    }
-    net_config_bytes = json.dumps(net_config_msg).encode('utf-8')
-        
-    log.debug("Planing network compleate")
-    for k, n in NETWORK_TOPOLOGY.nodes.items():
-        sock.sendto(net_config_bytes, (n.ip, PEER_PORT))
-        log.info(f"Node: {k} - {n.shard}")
+            # Handle embedding layer
+            if current_layer == 0 and layer_dict.get("model.embed_tokens.weight", 0) <= mem:
+                mem -= layer_dict.pop("model.embed_tokens.weight")
+
+            # Process model layers
+            keys_to_remove = []
+            sorted_layers = sorted(layer_dict.items(), key=lambda x: int(x[0].split(".")[2]))
+            for key, size in sorted_layers:
+                if "layer" not in key:
+                    continue
+                if f"layer.{last_layer_number}" in key and \
+                   mem - size - sum(layer_dict.get(k, 0) for k in ["lm_head.weight", "model.norm.weight"]) <= 0:
+                    break
+                if mem > size:
+                    current_layer += 1
+                    keys_to_remove.append(key)
+                    mem -= size
+                else:
+                    break
+
+            # Create shard if layers were assigned
+            if current_layer > start_layer:
+                if last_node_ip:
+                    NETWORK_TOPOLOGY.nodes[node_id].next_node_ip = last_node_ip
+                shard = Shard(SELECTED_MODEL, start_layer, current_layer-1, n_layers + 1, False)
+                NETWORK_TOPOLOGY.nodes[node_id].shard = shard
+                start_layer = current_layer
+                last_node_ip = node_id
+
+            # Remove processed layers
+            for key in keys_to_remove:
+                layer_dict.pop(key)
+
+    # Process GPU and CPU nodes
+    process_nodes(nodes_with_gpu)
+    process_nodes(nodes_cpu_only)
+
+    # Send network configuration
+    net_config = {"msg": "net_config", "data": serialize_network_config(NETWORK_TOPOLOGY)}
+    net_config_bytes = json.dumps(net_config).encode('utf-8')
+    
+    log.debug("Network planning complete")
+    for node_id, node in NETWORK_TOPOLOGY.nodes.items():
+        sock.sendto(net_config_bytes, (node.ip, PEER_PORT))
+        log.info(f"Node: {node_id} - {node.shard}")
 
 def get_model_metadata(url, meta_folder="meta"):
     # Fetch the first 8 bytes of the file
@@ -366,8 +423,22 @@ async def shard_planner():
             log.info("No Metadata to be found in repo")
             return
         
-        
-        total_memory = sum([ v.spec.ram for key, v in NETWORK_TOPOLOGY.nodes.items() ])
+
+        nodes_with_gpu, nodes_cpu_only = separate_nodes()
+
+        log.debug("Calculating total memory")
+        log.debug(f"GPU nodes: {nodes_with_gpu}")
+        log.debug(f"CPU nodes: {nodes_cpu_only}")
+
+        total_memory = 0
+        for (key, v) in nodes_with_gpu:
+            total_memory += (v.ram - PROGRAM_MINIMAL_SPACE - (MASTER_NODE_BUFFER if key == local_address and MASTER_NODE else 0))
+        for (key, v) in nodes_cpu_only:
+            log.debug(f"CPU node {key}: {v}")
+            total_memory += (v.ram - PROGRAM_MINIMAL_SPACE - (MASTER_NODE_BUFFER if key == local_address and MASTER_NODE else 0))
+
+        log.debug(f"Total memory: {total_memory}")
+            
         layers_dict = {}
 
         async def run_it(layers_dict):
@@ -423,11 +494,10 @@ def update_network():
     dev_spec = detect_device()
     connect_msg = {
     "msg": "connect",
-    "data": dev_spec.model_dump_json()  # Convert dataclass to dict
+    "data": json.dumps({key: spec.model_dump() for key, spec in dev_spec.items()})  # Convert dataclass to dict
     }
     connect_bytes = json.dumps(connect_msg).encode('utf-8')
 
-    dev_spec = detect_device()
     master_node_msg = {
         "msg": "MASTERNODE",    
     }
@@ -477,11 +547,16 @@ def convert_and_sort_by_offset(metadata):
     return sorted_items
 
 def init_model():
-    global MODEL, MODEL_LOCK, NETWORK_TOPOLOGY
+    global MODEL, MODEL_LOCK, NETWORK_TOPOLOGY, local_address
     shard: Shard = NETWORK_TOPOLOGY.nodes[local_address].shard
     with MODEL_LOCK:
-        MODEL = LlamaModel(shard)
-    
+        if "gpu" in NETWORK_TOPOLOGY.nodes[local_address].spec.keys():
+            with init_empty_weights():
+                MODEL = LlamaModel(shard)
+            MODEL.to_empty(device = torch.device("cuda"))
+        else:
+            MODEL = LlamaModel(shard)
+        
 
 def find_key_of_node_with_layer(topology: NetworkConfig, layer: int) -> Optional[str]:
     return next((key for key, node in topology.nodes.items() if layer >= node.shard.start_layer and  layer <= node.shard.end_layer ), None)
@@ -665,7 +740,7 @@ async def comunicate(websocket):
             ## GEN
             NETWORK_TOPOLOGY.generating = True
             with MODEL_LOCK:
-                MODEL.to(device=NETWORK_TOPOLOGY.nodes[local_address].spec.device)
+                # MODEL.to(device= "cude" if "gpu" NETWORK_TOPOLOGY.nodes[local_address].spec.keys() else "cpu")
                 MODEL.eval()
 
             n = NETWORK_TOPOLOGY.nodes[local_address] 
