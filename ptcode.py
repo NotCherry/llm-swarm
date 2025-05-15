@@ -3,18 +3,16 @@ import os
 import pathlib
 from typing import Any, Union
 import torch
-from transformers import AutoTokenizer
 from torch import nn
 from dataclasses import dataclass
 from model_configs import LLAMA_3_2_CONFIGS
 from util import log
 import gc
+from transformers import AutoTokenizer
+from util import SELECTED_MODEL
 from dotenv import load_dotenv
 load_dotenv()
 
-from util import SELECTED_MODEL
-
-# utils
 
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
     # Create a simple mapping of string names to torch dtypes
@@ -45,21 +43,7 @@ def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
     if dtype_str.startswith("torch."):
         dtype_str = dtype_str[6:]
     
-    # print(dtype_str)
-    # print(dtype_map.get(dtype_str))
     return dtype_map.get(dtype_str)
-
-
-# Define paths and device
-model_path = "./model.safetensors"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained(
-    SELECTED_MODEL,
-    use_fast=False,
-    token=os.getenv('HF_TOKEN')  # Replace with your Hugging Face token
-)
 @dataclass
 class Shard:
     model_id: str
@@ -85,26 +69,21 @@ class Shard:
         "loaded": self.loaded
         }
 
-STATE_DATA = {}
-
-def brodcast_state(layer, data):
-    global STATE_DATA
-    STATE_DATA[layer] = data
-
-def poll_state(layer):
-    global STATE_DATA
-    return STATE_DATA[layer]
-
-# Define the LLaMA 3.2 1B Instruct model architecture
-
 class LlamaModel(nn.Module):
-    def __init__(self, shard: Shard, model_size="1B"):
+    def __init__(self, shard: Shard, model_size="1B", device="cuda" if torch.cuda.is_available() else "cpu"):
         super().__init__()
+        
         self.config = LLAMA_3_2_CONFIGS[model_size]
         self.shard = shard
         self.loaded_keys = []
         self.model = nn.ModuleDict()
+        self.device = device
         if self.shard.is_first_layer():
+            self.tokenizer =  AutoTokenizer.from_pretrained(
+            SELECTED_MODEL,
+            use_fast=False,
+            token=os.getenv('HF_TOKEN')
+        )
             self.model["embed_tokens"] = nn.Embedding(self.config["vocab_size"], self.config["hidden_size"], dtype=self.config["dtype"])
         
         # Create only the layers within the shard's range, with correct indices
@@ -148,30 +127,6 @@ class LlamaModel(nn.Module):
             # brodcast_state(self.shard.end_layer, hidden_states)
             return hidden_states, position_ids, attention_mask
 
-    # def forward2(self, input_ids, attention_mask=None):
-    #     # Version for local testing
-    #     # Get initial hidden states
-    #     if self.shard.is_first_layer():
-    #         hidden_states = self.model["embed_tokens"](input_ids)
-    #     else:
-    #         hidden_states = poll_state(self.shard.start_layer - 1)
-
-    #     batch_size, seq_len = input_ids.shape
-    #     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        
-    #     # Process only the layers in this shard
-    #     for i in range(self.shard.start_layer, self.shard.end_layer + 1):
-    #         layer = self.model["layers"][str(i)]
-    #         hidden_states = layer(hidden_states, position_ids, attention_mask)
-        
-    #     # Final processing if last shard, otherwise broadcast
-    #     if self.shard.is_last_layer():
-    #         hidden_states = self.model["norm"](hidden_states)
-    #         logits = self.lm_head(hidden_states)
-    #         return logits
-    #     else:
-    #         brodcast_state(self.shard.end_layer, hidden_states)
-    #         return None # Return None if not the last shard
     def load_state_dict(self, state_dict, strict = True, assign = False):
         super().load_state_dict(state_dict, strict, assign)
         self.loaded_keys.extend(state_dict.keys())
@@ -349,7 +304,7 @@ def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tenso
     if not ".safetensors" in str(fn):
         fn = f"{fn}/model.safetensors"
     
-    print(f"Loading {fn}")  
+    log.info(f"Loading {fn}")  
     if (os.path.exists(fn)):
         f = open(fn, "rb")
         size = f.read(8)
@@ -379,7 +334,6 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, l="model.layers.{
 
 
     fn = f"{model_path}/model.safetensors.index.json"
-    # assert os.path.exists(fn), "safetensors.index.json not exists"
     layer_weights = {}
     f, data_start, metadata, loaded_all = (*safe_load_metadata_single(model_path), True)  if not os.path.exists(fn) else  safe_load_metadata_multifile(fn, l)
     last_layer = ""
@@ -435,11 +389,11 @@ def build_transformer(model_path: str, shard: Shard = None, verbose=False):
     
     expected_keys = set(dict(model.named_parameters()).keys())
     loaded_keys = set(loaded_keys)
-    print("Missing:", expected_keys - loaded_keys)
-    print("Unexpected:", loaded_keys - expected_keys)
+    log.debug(f"Missing: {expected_keys - loaded_keys}",)
+    log.debug(f"Unexpected: {loaded_keys - expected_keys}", )
     gc.collect()
     
-    model.to(device)
+    model.to(model.device)
     return model
 
 
@@ -452,15 +406,13 @@ def model_generate_text(
     with torch.no_grad():
         print("Generating...")
         if first_layer:
-            inputs = tokenizer(input_text, return_tensors="pt").to(device)
+            inputs = model.tokenizer(input_text, return_tensors="pt").to(model.device)
             input_ids = inputs["input_ids"]
             generated_ids = input_ids.clone()
-            end_token_id = tokenizer.eos_token_id
-        
-
-        
+            end_token_id = model.tokenizer.eos_token_id
+             
         logits = None
-        # IMPORTANT!!!
+
         if not last_layer:
             return model(generated_ids) # h, p_ids, att = model(generated_ids)
         if first_layer and last_layer:
@@ -491,55 +443,42 @@ def model_generate_text(
 
         generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
         
-        decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        # print(decoded_output)
+        decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
         if next_token_id.item() == end_token_id:
-            # assert False, "implement Brodcast end to masternode "
             return False
 
-        decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        # print("Output:", decoded_output)
+        decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         return decoded_output
 
 
 if __name__ == '__main__':
     model = None
-    model2 = None
+    model_path = "./model.safetensors"
 
     try:
-        # shard1 = Shard("LLAMA-3.2-1B", 0, 7, 16, True)
-        # model = build_transformer(".", shard1)
-        # shard2 = Shard("LLAMA-3.2-1B", 8, 15, 16, True)
-        # model2 = build_transformer(".", shard2)
-
         shard1 = Shard("LLAMA-3.2-1B", 0, 15, 16, True)
         model = build_transformer(".", shard1)
     except RuntimeError as e:
         raise "We are cooked"
 
-    # assert model != None and model2 != None
 
-    model.to(device)
+    model.to(model.device)
     model.eval()
-
-    # model2.to(device)
-    # model2.eval()
 
     # Example inference with top-p sampling
     input_text = "how to never give up on goal"
-    inputs = tokenizer(input_text, return_tensors="pt").to(device)
+    inputs = model.tokenizer(input_text, return_tensors="pt").to(model.device)
     print("Generating...")
     with torch.no_grad():
         input_ids = inputs["input_ids"]
         generated_ids = input_ids.clone()
-        end_token_id = tokenizer.eos_token_id
+        end_token_id = model.tokenizer.eos_token_id
         max_length = 50
         top_p = 0.9
         temperature = 0.7
 
         for _ in range(max_length):
-            # h, p_ids, att = model(generated_ids)
-            # logits = model2(hidden_states=h, position_ids=p_ids, attention_mask=att)
             logits = model(generated_ids)
             next_token_logits = logits[:, -1, :] / temperature
 
@@ -564,10 +503,10 @@ if __name__ == '__main__':
 
             generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
             
-            decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-            # print(decoded_output)
+            decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            log.debug(decoded_output)
             if next_token_id.item() == end_token_id:
                 break
 
-        decoded_output = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print("Output:", decoded_output)
+        decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
