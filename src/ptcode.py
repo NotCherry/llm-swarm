@@ -277,7 +277,7 @@ def remap_dict(state_dict):
 def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tensor, int, dict[str, Any]]:
     # Ensure the file path ends with '.safetensors'
     if ".safetensors" not in str(fn):
-        fn = f"{fn}/model.safetensors"
+        fn = f"{fn}.safetensors"
     
     log.info(f"Loading {fn}")
     
@@ -291,8 +291,9 @@ def safe_load_metadata_single(fn: Union[str, pathlib.Path]) -> tuple[torch.Tenso
         raw_data = f.read(data_start)
         data_start += 8
         # Return file handle, starting position, and decoded metadata
-        return f, data_start, json.loads(raw_data.decode('utf-8'))
-    
+        metadata = json.loads(raw_data.decode('utf-8'))
+        if '__metadata__' in metadata.keys(): del metadata['__metadata__']
+        return f, data_start, metadata
     # Raise error if file is not found
     raise ValueError(f"File {fn} not found")
 
@@ -359,7 +360,8 @@ def safe_load_by_layer(model_path: str, layer_index: int = -1, layer_prefix: str
             # Calculate the size of the data to read
             data_size = layer_data['data_offsets'][1] - layer_data['data_offsets'][0]
             # Read the raw data
-            raw_data = file_handle.read(data_size)
+            raw_data = bytearray(file_handle.read(data_size))
+            
             # Convert raw data to a tensor with the specified dtype and shape
             tensor = torch.frombuffer(raw_data, dtype=str_to_torch_dtype(layer_data['dtype'])).reshape(layer_data['shape'])
             layer_weights[key] = tensor
@@ -466,6 +468,7 @@ def model_generate_text(
             return False
 
         decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print(decoded_output)
         return decoded_output
 
 

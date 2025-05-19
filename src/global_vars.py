@@ -21,7 +21,10 @@ def get_outbound_ip():
 
 LISTEN_IP = '0.0.0.0'
 LISTEN_PORT = 5005
+LISTEN_PORT_TCP = 5006
 WS_PORT = 8543
+
+TCP_CONNECTIONS = []
 
 LOCAL_ADDRESS = get_outbound_ip()
 PROGRAM_MINIMAL_SPACE = (500 * 1024 * 1024)
@@ -30,7 +33,7 @@ MASTER_NODE_BUFFER = (600 * 1024 * 1024)
 SEARCH_IP_RANGE = [f"{".".join(LOCAL_ADDRESS.split(".")[:3])}.{i}" for i in range(1,254) ]
 PEER_PORT = 5005
 
-ACTIVE_HOSTS = []
+ACTIVE_HOSTS = {}
 MASTER_NODE = True
 MASTER_NODE_IP: str = None
 
@@ -50,6 +53,7 @@ NETWORK_CHECKSUM = None
 
 SELECTED_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
+WSS_SERVER_READY = threading.Event()
 
 SOCK_UDP = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 SOCK_UDP.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)

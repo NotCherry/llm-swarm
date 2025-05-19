@@ -6,24 +6,30 @@ import torch
 from src import global_vars
 from src.benchmarks import get_flops
 from src.structs import DeviceSpec, NetworkConfig
-
+from src.local_logger import log
 
 
 
 def serialize_network_config(config: NetworkConfig) -> str:
-    # Convert NetworkConfig to a dict, ensuring Pydantic models are serialized
+    if not isinstance(config.nodes, dict):
+        raise ValueError("config.nodes must be a dictionary")
     config_dict = {
         "nodes": {key: node.model_dump() for key, node in config.nodes.items()}
     }
-    # Serialize to JSON string
-    return json.dumps(config_dict)
+    try:
+        return json.dumps(config_dict, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Serialization failed: {str(e)}")
+
+import json
+from typing import Dict
 
 def deserialize_network_config(json_str: str) -> NetworkConfig:
     # Parse JSON string to dict
     config_dict = json.loads(json_str)
-    # Convert nodes dict to Node objects
+    # Convert nodes dict to Node objects, ensuring saved_layers is a dict
     nodes = {
-        key: Node(**node_data)
+        key: Node(**{**node_data, "saved_layers": node_data.get("saved_layers") or {}})
         for key, node_data in config_dict["nodes"].items()
     }
     # Create NetworkConfig with deserialized nodes
@@ -55,7 +61,7 @@ def detect_device():
 
 
 def get_model_filename():
-    return global_vars.SELECTED_MODEL.replace("/","-")
+    return global_vars.SELECTED_MODEL.replace("/","!")
 
 def separate_nodes():
     # Nodes with GPU devices
@@ -93,3 +99,33 @@ def convert_and_sort_by_offset(metadata):
     
     return sorted_items
 
+def debug_decorator(func):
+    def wrapper(*args, **kwargs):
+        # Get function name
+        func_name = func.__name__
+        
+        # Helper function to format values
+        def format_value(value):
+            if isinstance(value, (bytearray, bytes, list)):
+                return str(len(value))
+            elif isinstance(value, dict):
+                return '{' + ', '.join(f"{k}: {format_value(v)}" for k, v in value.items()) + '}'
+            return repr(value)
+        
+        # Format positional arguments
+        args_repr = [format_value(arg) for arg in args]
+        
+        # Format keyword arguments
+        kwargs_repr = [f"{k}={format_value(v)}" for k, v in kwargs.items()]
+        
+        # Combine all arguments
+        all_args = args_repr + kwargs_repr
+        
+        # Print function call details
+        log.error(f"Calling {func_name}({', '.join(all_args)})")
+        
+        # Call the original function
+        result = func(*args, **kwargs)
+        
+        return result
+    return wrapper

@@ -2,11 +2,12 @@
 # Start listener thread
 import asyncio
 import json
-import re
+from src.network.process_info import bordcast_net_config
 import threading
 import time
 from typing import Dict
 
+from src.network.process_info import broadcast_data_to_node
 from src.model.loading import download_model 
 from src import global_vars 
 from .. import global_vars
@@ -15,7 +16,13 @@ from src.structs import DictChecksumTracker, Shard
 from src.util import detect_device, get_last_layer_number, separate_nodes, serialize_network_config
 from src.local_logger import log
 
-def update_network():
+def network_service():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(update_network())
+    loop.close()
+
+async def update_network():
     dev_spec = detect_device()
     connect_msg = {
     "msg": "connect",
@@ -53,14 +60,26 @@ def update_network():
         time_start = time.perf_counter()
         broadcast_masternode()
         log.info(f"Node Type {'Master' if global_vars.MASTER_NODE else 'Worker'}")
-        global_vars.ACTIVE_HOSTS = []
+        
+        # Refreshing Host List
+        inactive_hosts = []
+        for host in  global_vars.ACTIVE_HOSTS:
+            active = await broadcast_data_to_node(host, {"type": "test"})
+            if not active: inactive_hosts.append(host)
+        tmp_hosts = []
+        for host in inactive_hosts:
+            if host in global_vars.ACTIVE_HOSTS:
+                tmp_hosts.append(host)
+        global_vars.ACTIVE_HOSTS = tmp_hosts
+
         detect()
         with global_vars.NETWORK_LOCK:
             keys = list(global_vars.NETWORK_TOPOLOGY.nodes.keys())
             for key in keys:
                 if key not in global_vars.ACTIVE_HOSTS:
                     del global_vars.NETWORK_TOPOLOGY.nodes[key]
-        time.sleep(7 - (time.perf_counter() - time_start) if (time.perf_counter() - time_start) > 0 else 0)
+        log.debug(f"Update network loop time {time.perf_counter() - time_start}")                    
+        time.sleep(10- (time.perf_counter() - time_start) if (time.perf_counter() - time_start) > 0 else 0)
 
 
 async def shard_planner():    
@@ -109,12 +128,12 @@ async def shard_planner():
             end_layer = max([int(k.split(".")[2]) for k in layers_dict.keys() if "model.layer" in k])
             await plan_network_from_layers(layers_dict,  end_layer)
 
-            NETWORK_CHECKSUM = DictChecksumTracker(global_vars.NETWORK_TOPOLOGY.nodes)._checksum
+            global_vars.NETWORK_CHECKSUM = DictChecksumTracker(global_vars.NETWORK_TOPOLOGY.nodes)._checksum
             # await download_file_with_metadata(url=url, hf_token=os.getenv('HF_TOKEN'))
             log.info("Loading of the models begins")
             await download_model()
 
-        if isinstance(metadata, list) or 'format' in metadata['__metadata__'].keys():
+        if isinstance(metadata, list) or ('__metadata__'in metadata.keys() and 'format' in metadata['__metadata__'].keys()):
             del metadata["__metadata__"]
             
             # add lm_head does not exist in smaller model account for loading embed layer as it 
@@ -218,13 +237,7 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
     process_nodes(nodes_cpu_only)
 
     # Send network configuration
-    net_config = {"msg": "net_config", "data": serialize_network_config(global_vars.NETWORK_TOPOLOGY)}
-    net_config_bytes = json.dumps(net_config).encode('utf-8')
-    
-    log.debug("Network planning complete")
-    for node_id, node in global_vars.NETWORK_TOPOLOGY.nodes.items():
-        global_vars.SOCK_UDP.sendto(net_config_bytes, (node.ip, global_vars.PEER_PORT))
-        log.info(f"Node: {node_id} - {node.shard}")
+    await bordcast_net_config()
 
 
 

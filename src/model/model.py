@@ -16,9 +16,8 @@ def init_model():
     shard: Shard = global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].shard
     with global_vars.MODEL_LOCK:
         if "gpu" in global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].spec.keys():
-            with init_empty_weights():
-                global_vars.MODEL = LlamaModel(shard)
-            global_vars.MODEL.to_empty(device = torch.device("cuda"))
+            global_vars.MODEL = LlamaModel(shard)
+            # global_vars.MODEL.to_empty(device = torch.device("cuda"))
         else:
             global_vars.MODEL = LlamaModel(shard)
         
@@ -60,57 +59,147 @@ def layers_size(metadata: Union[list, dict]) -> Dict[str, int]:
         sizes[f"model.layers.{current_layer}"] = layer_size
 
     return sizes
-        
 
-def get_model_metadata(url, meta_folder="meta"):
-    # Fetch the first 8 bytes of the file
-    meta = None
-    def download(url):
+def get_selected_model_metadata_from_index():
+    url = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors.index.json"
+
+    
+    layers_names = {}
+    headers = {}
+    headers["Authorization"] = f"Bearer {os.getenv("HF_TOKEN")}"
+    response = requests.get(url, headers=headers)
+    if response.status_code not in (206, 200, 404):
+        raise Exception(f"Failed to fetch metadata: HTTP {response.status_code}")
+    elif response.status_code != 404:
+        metadata = response.json()['weight_map']
+        
+        for k in metadata.keys():
+            url_of_safetensors = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/{k}"
+            layers_names = {**layers_names, **get_model_metadata(url_of_safetensors)}
+    else:
+        url_of_safetensors = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors"
+        layers_names = {**layers_names, **get_model_metadata(url_of_safetensors)}
+    
+    if not "lm_heads" in layers_names.keys():
+        layers_names["lm_head.weight"] = layers_names["model.embed_tokens.weight"]
+    if "__metadata__" in layers_names.keys():
+        del layers_names["__metadata__"]
+    return layers_names
+    
+
+
+def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
+    """
+    Fetch model metadata from a URL and cache it locally.
+    
+    Args:
+        url (str): URL to fetch metadata from
+        meta_folder (str): Directory to store metadata files
+    
+    Returns:
+        dict | None: Metadata dictionary if successful, None otherwise
+    """
+    def download_metadata(url: str) -> dict | None:
+        """Helper function to download metadata from URL."""
         try:
             headers = {'Range': 'bytes=0-7'}
-            hf_token = os.getenv('HF_TOKEN')
-            if hf_token != "":
+            hf_token = os.getenv('HF_TOKEN', '')
+            if hf_token:
                 headers["Authorization"] = f"Bearer {hf_token}"
 
-            response = requests.get(url, headers=headers)
-            # Interpret the bytes as a little-endian unsigned 64-bit integer
+            # Fetch first 8 bytes to get header length
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
             length_of_header = struct.unpack('<Q', response.content)[0]
-            # Fetch length_of_header bytes starting from the 9th byte
+
+            # Fetch metadata based on header length
             headers['Range'] = f'bytes=8-{7 + length_of_header}'
-            response = requests.get(url, headers=headers)
-            # Interpret the response as a JSON object
-            return response.json()
-        except Exception as e:
-            log.error(e)
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            # Parse JSON response
+            meta = response.json()
+            if '__metadata__' in meta:
+                del meta['__metadata__']
+            return meta
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log.error(f"Failed to fetch metadata from {url}: {e}")
+            # Try fallback URL
             try:
-                url = url + ".index.json"
-                response = requests.get(url)
-                return response.json() 
-            except:
+                fallback_url = f"{url}.index.json"
+                response = requests.get(fallback_url, timeout=10)
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as e:
+                log.error(f"Failed to fetch metadata from fallback {fallback_url}: {e}")
                 return None
-    
-    f_mode = "r+"
-    if not os.path.exists("metadata_store.json"):
-        f_mode = "w+"
 
-    with open("metadata_store.json", f_mode) as f:
-        data = {}
-        if f_mode == "r+":
-            data = json.loads(f.read())
-        # log.debug(f"metadata_store.json: {data}")
-        if url not in data.keys():
-            meta = download(url)
-            if meta != None:
-                fn_meta = f"{get_model_filename()}.json"
-                data[url] = fn_meta
-                f.write(json.dumps(data))
-                if not os.path.exists(meta_folder):
-                    os.makedirs(meta_folder)
-                    log.info(f"Created folder: {meta_folder}")
-                with open(f"{meta_folder}/{fn_meta}", 'w') as ff:
-                    ff.write(json.dumps(meta))
-                return meta    
+    # Initialize metadata store
+    metadata_store_file = "metadata_store.json"
+    data = {}
 
-        else:
-            with open(f"{meta_folder}/{data[url]}", "r") as mf:
+    # Load existing metadata store
+    if os.path.exists(metadata_store_file):
+        try:
+            with open(metadata_store_file, 'r') as f:
+                content = f.read().strip()
+                if content:  # Check if file is not empty
+                    data = json.loads(content)
+                else:
+                    log.warning(f"{metadata_store_file} is empty")
+        except json.JSONDecodeError as e:
+            log.error(f"Failed to parse {metadata_store_file}: {e}")
+            return None
+        except IOError as e:
+            log.error(f"Failed to read {metadata_store_file}: {e}")
+            return None
+
+    # Check if metadata is already cached
+    if url in data:
+        try:
+            with open(os.path.join(meta_folder, data[url]), 'r') as mf:
                 return json.loads(mf.read())
+        except (IOError, json.JSONDecodeError) as e:
+            log.error(f"Failed to read cached metadata for {url}: {e}")
+            # If cached file is corrupted, try downloading again
+            meta = download_metadata(url)
+            if meta is None:
+                return None
+    else:
+        # Download new metadata
+        meta = download_metadata(url)
+        if meta is None:
+            return None
+
+        # Save metadata to file
+        try:
+            # Assuming get_model_filename() is defined elsewhere
+            fn_meta = f"{get_model_filename()}.json"
+            data[url] = fn_meta
+
+            # Create meta_folder if it doesn't exist
+            os.makedirs(meta_folder, exist_ok=True)
+            log.info(f"Ensured folder exists: {meta_folder}")
+
+            # Write metadata to file
+            with open(os.path.join(meta_folder, fn_meta), 'w') as ff:
+                json.dump(meta, ff, indent=2)
+            
+            # Update metadata store
+            with open(metadata_store_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            return meta
+
+        except (IOError, NameError) as e:
+            log.error(f"Failed to save metadata for {url}: {e}")
+            return None
+            
+
+def get_metadata_size(url):
+    meta = get_model_metadata(url)
+    json_bytes = json.dumps(meta, separators=(",", ":")).encode('utf-8')
+    extra = (8 - len(json_bytes) % 8) % 8
+    json_bytes += b" " * extra
+    return len(json_bytes)

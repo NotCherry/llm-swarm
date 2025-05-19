@@ -52,7 +52,7 @@ class Node(BaseModel):
     shard: Optional[Shard] = None
     next_node_ip: Optional[str] = None
     loaded_layers: List[str] = []
-    saved_layers: dict[str, List[str]] = {}
+    saved_layers: Optional[Dict[str, List[str]]] = {}
     def to_tuple(self):
         """Convert Node to a tuple for checksum computation."""
         return (self.ip, self.spec)
@@ -63,11 +63,6 @@ class NetworkConfig():
     loading_model: bool = False
     loaded_model: bool = False
     generating: bool = False
-    update_time: int = time.time()
-
-    def __setattr__(self, name, value):
-        super().__setattr__("update_time", time.time())
-        super().__setattr__(name, value)
 
 class DictChecksumTracker:
     def __init__(self, dictionary: Dict[str, Node]):

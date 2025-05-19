@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.7.0",
     "httpx>=0.28.1",
+    "jax>=0.6.1",
     "jinja2<=3.1.6",
+    "ml-dtypes>=0.5.1",
     "psutil>=7.0.0",
     "pydantic>=2.11.4",
     "python-dotenv>=1.1.0",
