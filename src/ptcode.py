@@ -4,12 +4,12 @@ import pathlib
 from typing import Any, Union
 import torch
 from torch import nn
-from dataclasses import dataclass
-from model_configs import LLAMA_3_2_CONFIGS
-from src.util import log
+from src.model.model_configs import LLAMA_3_2_CONFIGS
+from src.structs import Shard
+from src.local_logger import log
 import gc
 from transformers import AutoTokenizer
-from src.util import SELECTED_MODEL
+from src import global_vars
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -44,30 +44,6 @@ def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
         dtype_str = dtype_str[6:]
     
     return dtype_map.get(dtype_str)
-@dataclass
-class Shard:
-    model_id: str
-    start_layer: int
-    end_layer: int
-    n_layers: int
-    loaded: bool
-
-    def is_first_layer(self) -> bool:
-        return self.start_layer == 0
-
-    def is_last_layer(self) -> bool:
-        return self.end_layer == (self.n_layers - 1)
-
-    def get_layer_count(self) -> int:
-        return self.end_layer + 1
-    def to_dict(self) -> dict:
-        return {
-        "model_id": self.model_id,
-        "start_layer": self.start_layer,
-        "end_layer": self.end_layer,
-        "n_layers": self.n_layers,
-        "loaded": self.loaded
-        }
 
 class LlamaModel(nn.Module):
     def __init__(self, shard: Shard, model_size="1B", device="cuda" if torch.cuda.is_available() else "cpu"):
@@ -80,7 +56,7 @@ class LlamaModel(nn.Module):
         self.device = device
         if self.shard.is_first_layer():
             self.tokenizer =  AutoTokenizer.from_pretrained(
-            SELECTED_MODEL,
+            global_vars.SELECTED_MODEL,
             use_fast=False,
             token=os.getenv('HF_TOKEN')
         )

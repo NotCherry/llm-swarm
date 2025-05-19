@@ -14,3 +14,4 @@ random_stuff
 *.json
 .env
 *.log*
+net.cfg
