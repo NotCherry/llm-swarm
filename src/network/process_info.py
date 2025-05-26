@@ -18,10 +18,7 @@ import safetensors
 
 import json
 
-# @debug_decorator
 async def process_info(message, client_ip):
-    if type(message) != dict:
-        message = json.loads(message)
     if message['type'] == "load_layer":
         weights = safe_load_by_layer(get_model_filename(), layer_prefix=message['data']['layer_name'])
         if weights:

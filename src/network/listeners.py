@@ -35,26 +35,14 @@ def listen(sock):
                 global_vars.NETWORK_TOPOLOGY.nodes[addr[0]].spec = spec
         if data['msg'] == "MASTERNODE" and ((global_vars.START_TIME + global_vars.WAIT_TIME) > time.perf_counter()):
             log.info(f"Master node address: {addr[0]}")
-            # maby we can just append it to the node struct?
             global_vars.MASTER_NODE = False
             global_vars.MASTER_NODE_IP = addr[0]
-            # TODO Handle case when masternode Disapear
-       
-
-# Struct like
-# type: str
-# data: {
-# h_state
-# att
-# pid
-# input_prompt
-# }
-#
 
 async def comunicate(websocket):
     client_ip, client_port = websocket.remote_address
     async for message in websocket:
-        log.debug(f"Got message: {message['type']}")
+        if type(message) != dict:
+            message = json.loads(message)
         process_info(message, client_ip)
         
 
