@@ -33,7 +33,7 @@ MASTER_NODE_BUFFER = (600 * 1024 * 1024)
 SEARCH_IP_RANGE = [f"{".".join(LOCAL_ADDRESS.split(".")[:3])}.{i}" for i in range(1,254) ]
 PEER_PORT = 5005
 
-ACTIVE_HOSTS = {}
+ACTIVE_HOSTS = []
 MASTER_NODE = True
 MASTER_NODE_IP: str = None
 
