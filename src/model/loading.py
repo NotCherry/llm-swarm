@@ -28,7 +28,6 @@ async def download_model():
     assert node_key == global_vars.LOCAL_ADDRESS
 
     global_vars.NETWORK_TOPOLOGY.loading_model = True
-    global_vars.NETWORK_TOPOLOGY.loaded_model = False
     
     missing_layers = await rearrange_layers_in_nodes()
     log.info(f"Missing layers in network: {missing_layers}")
@@ -36,7 +35,6 @@ async def download_model():
     if len(missing_layers) <= 0:
         log.info("All layers were loaded from network")
         global_vars.NETWORK_TOPOLOGY.loading_model = False
-        global_vars.NETWORK_TOPOLOGY.loaded_model = True
         return
     
     url = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors.index.json"
