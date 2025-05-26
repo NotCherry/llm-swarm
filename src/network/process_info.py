@@ -22,10 +22,13 @@ import json
 async def process_info(message, client_ip):
     if type(message) != dict:
         message = json.loads(message)
+    if message['type'] == "load_layer":
+        weights = safe_load_by_layer(get_model_filename(), layer_prefix=message['data']['layer_name'])
+        if weights:
+            await broadcast_layer_to_node(global_vars.LOCAL_ADDRESS, weights)
     if message['type'] == "layer_data":
         state_dict = message['data']
         data_to_model(state_dict)
-
         await save_local_layers(state_dict)                  
     if message['type'] == "layer_request":
         send_requested_layer(message['data']['target_node', message['data']['layer_name']])
@@ -85,12 +88,12 @@ async def process_info(message, client_ip):
         log.error(message)
         with global_vars.NETWORK_LOCK:          
             global_vars.NETWORK_TOPOLOGY.nodes[client_ip].loaded_layers.extend(message["data"])
+            global_vars.NETWORK_TOPOLOGY.nodes[client_ip].loaded_layers = list(set(global_vars.NETWORK_TOPOLOGY.nodes[client_ip].loaded_layers))
         await bordcast_net_config()
 
     if message['type'] == "local_layers":
         with global_vars.NETWORK_LOCK:
             model_name = get_model_filename().replace('!', '/')
-            log.error(model_name)
             if client_ip not in global_vars.NETWORK_TOPOLOGY.nodes.keys():
                 global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS] = Node(ip=global_vars.LOCAL_ADDRESS, spec=detect_device())
             if message["data"] is not None:    
@@ -290,16 +293,21 @@ async def broadcast_layer_to_node(node, layer_data: Dict[str, bytes]):
         await broadcast_data_to_node(global_vars.NETWORK_TOPOLOGY.nodes[node].ip, {"type":"layer_data", "data":state_dict})
         return
    
-
     await data_to_model(state_dict)
-
-
     await save_local_layers(state_dict)
 
 @debug_decorator
 async def request_layer_from_node(target_node, dst_node, layer_name):
     await broadcast_data_to_node(global_vars.NETWORK_TOPOLOGY.nodes[target_node].ip, {"type":"layer_request", "data": {"layer_name": layer_name, "target_node": dst_node}})
-    
+
+# Target node is ip
+@debug_decorator
+async def request_loading_local_layer(target_node: str, layer_name: str):
+    if layer_name in global_vars.NETWORK_TOPOLOGY.nodes[target_node].loaded_layers:
+        log.info(f"Layer {layer_name} already loaded on {target_node}, no need to request it.")
+        return
+    await broadcast_data_to_node(target_node, {"type":"load_layer", "data": {"layer_name": layer_name}})
+
 @debug_decorator
 def send_requested_layer(target_node, layer_name):
     if layer_name in global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers:

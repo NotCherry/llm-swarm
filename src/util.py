@@ -129,3 +129,20 @@ def debug_decorator(func):
         
         return result
     return wrapper
+
+from urllib.parse import urlparse
+
+def normalize_url(url):
+    # Check if url is a valid string
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string")
+
+    # Parse the URL to check for scheme and netloc
+    parsed = urlparse(url)
+    
+    # If no scheme (e.g., "example.com" or "path/to/model"), prepend the base URL
+    if not parsed.scheme or not parsed.netloc:
+        return f"https://huggingface.co/{url.strip('/')}/resolve/main/model.safetensors"
+    
+    # If the URL already has a valid scheme and netloc, return it unchanged
+    return url

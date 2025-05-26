@@ -133,9 +133,7 @@ async def shard_planner():
             log.info("Loading of the models begins")
             await download_model()
 
-        if isinstance(metadata, list) or ('__metadata__'in metadata.keys() and 'format' in metadata['__metadata__'].keys()):
-            del metadata["__metadata__"]
-            
+        if "weight_map" not in metadata.keys():
             # add lm_head does not exist in smaller model account for loading embed layer as it 
             if "output" not in metadata.keys() and "lm_head" not in metadata.keys():
                 metadata["lm_head.weight"] = metadata['model.embed_tokens.weight']
@@ -174,6 +172,9 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
     # Get model metadata and set buffer
     url = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors"
     metadata = get_model_metadata(url)
+    
+    assert 'weight_map' not in metadata.keys(), "Implement handling of metadata with weight_map"
+         
     last_layer_number = get_last_layer_number(metadata)
     global_vars.MASTER_NODE_BUFFER = max(layers_size(metadata).values())
 

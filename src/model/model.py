@@ -8,7 +8,7 @@ import torch
 from src.ptcode import LlamaModel
 from src.structs import Shard
 from accelerate import init_empty_weights
-from src.util import get_model_filename
+from src.util import debug_decorator, get_model_filename, normalize_url
 from src.local_logger import log
 from src import global_vars 
 
@@ -87,7 +87,7 @@ def get_selected_model_metadata_from_index():
     return layers_names
     
 
-
+@debug_decorator
 def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
     """
     Fetch model metadata from a URL and cache it locally.
@@ -99,6 +99,8 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
     Returns:
         dict | None: Metadata dictionary if successful, None otherwise
     """
+    url = normalize_url(url)
+
     def download_metadata(url: str) -> dict | None:
         """Helper function to download metadata from URL."""
         try:
@@ -130,6 +132,8 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
                 fallback_url = f"{url}.index.json"
                 response = requests.get(fallback_url, timeout=10)
                 response.raise_for_status()
+                if "__metadata__" in response.json():
+                    del response.json()['__metadata__']
                 return response.json()
             except requests.RequestException as e:
                 log.error(f"Failed to fetch metadata from fallback {fallback_url}: {e}")

@@ -12,10 +12,10 @@ import requests
 from tqdm import tqdm
 from src import global_vars
 
-from src.network.process_info import broadcast_layer_to_node, request_layer_from_node
+from src.network.process_info import broadcast_layer_to_node, request_layer_from_node, request_loading_local_layer
 from src.ptcode import safe_load_by_layer, safe_load_metadata_single
 from src.structs import NetworkConfig
-from src.util import convert_and_sort_by_offset, get_model_filename
+from src.util import convert_and_sort_by_offset, debug_decorator, get_model_filename
 
 
 def find_key_of_node_with_layer(topology: NetworkConfig, layer: int) -> Optional[str]:
@@ -31,6 +31,7 @@ async def download_model():
     global_vars.NETWORK_TOPOLOGY.loaded_model = False
     
     missing_layers = await rearrange_layers_in_nodes()
+    log.info(f"Missing layers in network: {missing_layers}")
 
     if len(missing_layers) <= 0:
         log.info("All layers were loaded from network")
@@ -208,7 +209,7 @@ def verify_local_keys(folder_path="."):
         log.error(f"An error occurred: {e}")
 
 
-
+@debug_decorator
 async def rearrange_layers_in_nodes():
     """
     The primary goal is to manage a distributed network of nodes, each storing specific model layers 
@@ -223,8 +224,6 @@ async def rearrange_layers_in_nodes():
     if Node B uses a base-1000 (1 Gbps) network interface and Node C uses a base-10G (10 Gbps) interface, 
     the system will factor in these differences to optimize layer transfers and model performance in future iterations.
     """
-    log.debug("Rearrange nodes")
-    layers_missing_in_network = []
     with global_vars.NETWORK_LOCK:
         network_layers = {
             k: v.saved_layers[global_vars.SELECTED_MODEL] for k, v in global_vars.NETWORK_TOPOLOGY.nodes.items()
@@ -233,30 +232,27 @@ async def rearrange_layers_in_nodes():
         network_shards = {
             k: v.shard for k, v in global_vars.NETWORK_TOPOLOGY.nodes.items()
         }
+    
+    metadata = get_model_metadata(global_vars.SELECTED_MODEL)
+
+    if "weight_map" in metadata.keys():
+        metadata = metadata["weight_map"]
+    if 'lm_head.weight' not in metadata.keys():
+        metadata['lm_head.weight'] = {}
+
+    loaded = {"embed": False, "norm": False, "lm_head": False}
     for k, v in network_shards.items():
         # Get the range of layers for this shard (as strings)
         layers = [str(i) for i in range(v.start_layer, v.end_layer + 1)]
-        last_layer = global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].shard.n_layers - 1
-
-        # Track loaded components
-        loaded = {"embed": False, "norm": False, "lm_head": False}
+        last_layer = global_vars.NETWORK_TOPOLOGY.nodes[k].shard.n_layers - 1
 
         for layer in layers:
             # Check for matching layer in network_layers
             for layer_name in network_layers.get(k, []):
                 if re.search(rf'\.layers\.{layer}\b', layer_name):
                     layer_found = True
-                    # Add layer to loaded_layers if not already present
-                    with global_vars.NETWORK_LOCK:
-                        if layer_name not in global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers:
-                            global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers.append(layer_name)
-                    
-                    # Load and broadcast layer weights
-                    weights = safe_load_by_layer(get_model_filename(), layer_prefix=layer_name)
-                    if weights:
-                        await broadcast_layer_to_node(global_vars.LOCAL_ADDRESS, weights)
-                    break  # Found the layer, move to next
-
+                    await request_loading_local_layer(k, layer_name)
+                    del metadata[layer_name]
             # Handle special layers (embed, norm, lm_head) for specific conditions
             special_layers = [
                 (layer == "0" and not loaded["embed"], "model.embed_tokens.weight", "embed"),
@@ -266,52 +262,25 @@ async def rearrange_layers_in_nodes():
 
             for condition, layer_name, key in special_layers:
                 if condition:
-                    global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers.append(layer_name)
-                    weights = safe_load_by_layer(get_model_filename(), layer_prefix=layer_name)
-                    if weights:
-                        await broadcast_layer_to_node(global_vars.LOCAL_ADDRESS, weights)
-                        loaded[key] = True
-                    else:
-                        log.error(f"Failed to load {layer_name}")
-
-
+                    await request_loading_local_layer(k, layer_name)
+                    loaded[key] = True
+                    del metadata[layer_name]
                 
-            if layer_found:
-                # Layer is already loaded on this node, no action needed
-                continue
-            else:
-                # Layer not found on this node, search other nodes
-                target_node = None
-                for node_key, saved_layers in network_layers.items():
-                    if node_key == k:
-                        continue  # Skip the current node
-                    for layer_name in saved_layers:
-                        if re.search(rf'\.layers\.{layer}\b', layer_name):
-                            target_node = node_key
-                            # Add layer to loaded_layers if not already present
-                            with global_vars.NETWORK_LOCK:
-                                if layer_name not in global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers:
-                                    global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers.append(layer_name)
-                            
-                            # Load and broadcast layer weights
-                            await request_layer_from_node(target_node, layer_name)
-
-                            # Handle special layers (embed, norm, lm_head) for specific conditions
-                            special_layers = [
-                                (layer == "0" and not loaded["embed"], "model.embed_tokens.weight", "embed"),
-                                (layer == str(last_layer) and not loaded["norm"], "model.norm.weight", "norm"),
-                                (layer == str(last_layer) and not loaded["lm_head"], "lm_head.weight", "lm_head")
-                            ]
-
+            if not layer_found:
+                for node, node_layers in network_layers.items():
+                    if node != k:  # Skip local node
+                        for layer_name in node_layers:
+                            # Check for regular layer
+                            if re.search(rf'\.layers\.{layer}\b', layer_name):
+                                # Layer found on another node, send request
+                                await request_layer_from_node(node, k, layer_name)
+                                del metadata[layer_name]
+                            # Check for special layers
                             for condition, special_layer_name, key in special_layers:
-                                if condition:
-                                    global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers.append(special_layer_name)
-                                    await broadcast_layer_to_node(global_vars.LOCAL_ADDRESS, weights)
-                                    loaded[key] = True
-                    if target_node:
-                        break
-                
-                if not target_node:                    
-                    log.error(f"Layer {layer} not found on any node for model {global_vars.SELECTED_MODEL}.")
-                    layers_missing_in_network.append(layer)
-    return layers_missing_in_network
+                                if condition and layer_name == special_layer_name:
+                                    # Special layer found on another node, send request
+                                    await request_layer_from_node(node, k, layer_name)
+                                    loaded[key] = True  # Mark as loaded to avoid re-checking
+                                    del metadata[layer_name]
+
+    return list(metadata.keys()) if metadata else []
