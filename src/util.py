@@ -133,16 +133,33 @@ def debug_decorator(func):
 from urllib.parse import urlparse
 
 def normalize_url(url):
+    """
+    Normalize a URL or model identifier to a full HuggingFace model URL.
+    
+    Args:
+        url (str): Either a full URL or a model identifier like "Qwen/Qwen3-1.7B"
+        
+    Returns:
+        str: Full URL to the model.safetensors file
+        
+    Raises:
+        ValueError: If URL is not a valid non-empty string
+    """
     # Check if url is a valid string
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL must be a non-empty string")
-
+    
+    url = url.strip()
+    
     # Parse the URL to check for scheme and netloc
     parsed = urlparse(url)
     
-    # If no scheme (e.g., "example.com" or "path/to/model"), prepend the base URL
-    if not parsed.scheme or not parsed.netloc:
-        return f"https://huggingface.co/{url.strip('/')}/resolve/main/model.safetensors"
+    # If it's already a complete URL (has both scheme and netloc), return unchanged
+    if parsed.scheme and parsed.netloc:
+        return url
     
-    # If the URL already has a valid scheme and netloc, return it unchanged
-    return url
+    # If it's a model identifier (like "Qwen/Qwen3-1.7B") or partial path,
+    # convert it to full HuggingFace URL
+    # Remove leading/trailing slashes to normalize the identifier
+    model_id = url.strip('/')
+    return f"https://huggingface.co/{model_id}/resolve/main/model.safetensors"

@@ -11,7 +11,7 @@ from src.network.process_info import broadcast_data_to_node
 from src.model.loading import download_model 
 from src import global_vars 
 from .. import global_vars
-from src.model.model import get_model_metadata, layers_size
+from src.model.model import get_model_metadata, layers_size, weight_map_to_merged_metadata
 from src.structs import DictChecksumTracker, Shard
 from src.util import detect_device, get_last_layer_number, separate_nodes, serialize_network_config
 from src.local_logger import log
@@ -157,12 +157,12 @@ async def shard_planner():
             return
         
         if metadata['metadata']['total_size'] is not None:
-            files = set([v for key, v in metadata['weight_map']])
+            files = set([v for key, v in metadata['weight_map'].items()])
 
             for fn in files:
                 url = "/".join(url.split("/")[:-1]) + "/" + fn
                 fn_metadat = get_model_metadata(url)
-                del fn_metadat['__metadata__']
+                if '__metadata__' in fn_metadat: del fn_metadat['__metadata__']
                 layers_dict.update(fn_metadat)
             layers_dict = layers_size(layers_dict)
             await run_it(layers_dict)
@@ -173,7 +173,9 @@ async def plan_network_from_layers(layer_dict: Dict[str, int], n_layers):
     url = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors"
     metadata = get_model_metadata(url)
     
-    assert 'weight_map' not in metadata.keys(), "Implement handling of metadata with weight_map"
+    if 'weight_map' in metadata.keys():
+        metadata = weight_map_to_merged_metadata(metadata['weight_map'])
+        
          
     last_layer_number = get_last_layer_number(metadata)
     global_vars.MASTER_NODE_BUFFER = max(layers_size(metadata).values())

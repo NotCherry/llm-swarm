@@ -130,25 +130,11 @@ class LlamaModel(nn.Module):
 
         # Print results
         if mismatches:
-            print("Mismatched layers found:")
+            log.error("Mismatched layers found:")
             for mismatch in mismatches:
-                print(f" - {mismatch}")
+                log.error(f" - {mismatch}")
         else:
-            print("All layers match perfectly, including nn.ModuleDict sub-models!")
-
-
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5, dtype=torch.bfloat16):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
+            log.info("All layers match perfectly, including nn.ModuleDict sub-models!")
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, intermediate_size, num_key_value_heads, rope_theta, rms_norm_eps, dtype):
@@ -423,7 +409,7 @@ def model_generate_text(
         temperature = 0.7, first_layer=False, last_layer=False, h=None, p_ids=None, att =None ):
     
     with torch.no_grad():
-        print("Generating...")
+        log.info("Generating...")
         if first_layer:
             inputs = model.tokenizer(input_text, return_tensors="pt").to(model.device)
             input_ids = inputs["input_ids"]
@@ -468,7 +454,7 @@ def model_generate_text(
             return False
 
         decoded_output = model.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print(decoded_output)
+        log.info(decoded_output)
         return decoded_output
 
 
@@ -489,7 +475,7 @@ if __name__ == '__main__':
     # Example inference with top-p sampling
     input_text = "how to never give up on goal"
     inputs = model.tokenizer(input_text, return_tensors="pt").to(model.device)
-    print("Generating...")
+    log.info("Generating...")
     with torch.no_grad():
         input_ids = inputs["input_ids"]
         generated_ids = input_ids.clone()

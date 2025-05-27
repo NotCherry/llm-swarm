@@ -51,7 +51,8 @@ NETWORK_TOPOLOGY = NetworkConfig(nodes={})
 NETWORK_LOCK = threading.Lock()
 NETWORK_CHECKSUM = None
 
-SELECTED_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+SELECTED_MODEL = "Qwen/Qwen3-1.7B"
+# SELECTED_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
 WSS_SERVER_READY = threading.Event()
 

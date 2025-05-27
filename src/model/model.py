@@ -5,23 +5,33 @@ import struct
 from typing import Dict, Union
 import requests
 import torch
+from src.qwen3 import Qwen3Model
 from src.ptcode import LlamaModel
 from src.structs import Shard
 from accelerate import init_empty_weights
 from src.util import debug_decorator, get_model_filename, normalize_url
 from src.local_logger import log
 from src import global_vars 
+import hashlib
 
-def init_model():
+
+match_model = {
+    "Qwen": Qwen3Model,
+    "meta-llama": LlamaModel,
+}
+
+async def init_model():
+    log.error(f"Initializing model {global_vars.SELECTED_MODEL} on shard {global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].shard}")
     shard: Shard = global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].shard
     with global_vars.MODEL_LOCK:
         if "gpu" in global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].spec.keys():
-            global_vars.MODEL = LlamaModel(shard)
+            global_vars.MODEL = match_model[global_vars.SELECTED_MODEL.split('/')[0]](shard)
             # global_vars.MODEL.to_empty(device = torch.device("cuda"))
         else:
-            global_vars.MODEL = LlamaModel(shard)
+            global_vars.MODEL = match_model[global_vars.SELECTED_MODEL.split('/')[0]](shard)
         
-
+    if global_vars.MODEL is None:
+        raise Exception(f"Model {global_vars.SELECTED_MODEL} not found or not supported.")
 
 def layers_size(metadata: Union[list, dict]) -> Dict[str, int]:
     sizes = {}
@@ -62,8 +72,6 @@ def layers_size(metadata: Union[list, dict]) -> Dict[str, int]:
 
 def get_selected_model_metadata_from_index():
     url = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/model.safetensors.index.json"
-
-    
     layers_names = {}
     headers = {}
     headers["Authorization"] = f"Bearer {os.getenv("HF_TOKEN")}"
@@ -72,8 +80,8 @@ def get_selected_model_metadata_from_index():
         raise Exception(f"Failed to fetch metadata: HTTP {response.status_code}")
     elif response.status_code != 404:
         metadata = response.json()['weight_map']
-        
-        for k in metadata.keys():
+        layers_files =  set(metadata.values())
+        for k in layers_files:
             url_of_safetensors = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/{k}"
             layers_names = {**layers_names, **get_model_metadata(url_of_safetensors)}
     else:
@@ -85,23 +93,35 @@ def get_selected_model_metadata_from_index():
     if "__metadata__" in layers_names.keys():
         del layers_names["__metadata__"]
     return layers_names
-    
 
-@debug_decorator
+def weight_map_to_merged_metadata(weight_map: dict) -> dict:
+    layers_names = {}
+    layers_files =  set(weight_map.values())
+    for k in layers_files:
+        url_of_safetensors = f"https://huggingface.co/{global_vars.SELECTED_MODEL}/resolve/main/{k}"
+        layers_names = {**layers_names, **get_model_metadata(url_of_safetensors)}
+    
+    if not "lm_heads" in layers_names.keys():
+        layers_names["lm_head.weight"] = layers_names["model.embed_tokens.weight"]
+    if "__metadata__" in layers_names.keys():
+        del layers_names["__metadata__"]
+    return layers_names
+        
+
 def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
     """
-    Fetch model metadata from a URL and cache it locally.
-    
+    Fetch model metadata from a URL and cache it locally with unique filenames.
+
     Args:
         url (str): URL to fetch metadata from
         meta_folder (str): Directory to store metadata files
-    
+
     Returns:
         dict | None: Metadata dictionary if successful, None otherwise
     """
     url = normalize_url(url)
 
-    def download_metadata(url: str) -> dict | None:
+    def download_metadata(url: str) -> tuple[dict | None, str]:
         """Helper function to download metadata from URL."""
         try:
             headers = {'Range': 'bytes=0-7'}
@@ -118,12 +138,12 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
             headers['Range'] = f'bytes=8-{7 + length_of_header}'
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
-            
+
             # Parse JSON response
             meta = response.json()
             if '__metadata__' in meta:
                 del meta['__metadata__']
-            return meta
+            return meta, url
 
         except (requests.RequestException, ValueError, KeyError) as e:
             log.error(f"Failed to fetch metadata from {url}: {e}")
@@ -132,12 +152,13 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
                 fallback_url = f"{url}.index.json"
                 response = requests.get(fallback_url, timeout=10)
                 response.raise_for_status()
-                if "__metadata__" in response.json():
-                    del response.json()['__metadata__']
-                return response.json()
+                meta = response.json()
+                if "__metadata__" in meta:
+                    del meta['__metadata__']
+                return meta, url
             except requests.RequestException as e:
                 log.error(f"Failed to fetch metadata from fallback {fallback_url}: {e}")
-                return None
+                return None, url
 
     # Initialize metadata store
     metadata_store_file = "metadata_store.json"
@@ -148,7 +169,7 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
         try:
             with open(metadata_store_file, 'r') as f:
                 content = f.read().strip()
-                if content:  # Check if file is not empty
+                if content:
                     data = json.loads(content)
                 else:
                     log.warning(f"{metadata_store_file} is empty")
@@ -167,20 +188,21 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
         except (IOError, json.JSONDecodeError) as e:
             log.error(f"Failed to read cached metadata for {url}: {e}")
             # If cached file is corrupted, try downloading again
-            meta = download_metadata(url)
+            meta, result_url = download_metadata(url)
             if meta is None:
                 return None
     else:
         # Download new metadata
-        meta = download_metadata(url)
+        meta, result_url = download_metadata(url)
         if meta is None:
             return None
 
-        # Save metadata to file
+        # Save metadata to file with a unique filename
         try:
-            # Assuming get_model_filename() is defined elsewhere
-            fn_meta = f"{get_model_filename()}.json"
-            data[url] = fn_meta
+            # Generate a unique filename based on URL hash
+            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+            fn_meta = f"metadata_{url_hash}.json"
+            data[result_url] = fn_meta
 
             # Create meta_folder if it doesn't exist
             os.makedirs(meta_folder, exist_ok=True)
@@ -189,11 +211,11 @@ def get_model_metadata(url: str, meta_folder: str = "meta") -> dict | None:
             # Write metadata to file
             with open(os.path.join(meta_folder, fn_meta), 'w') as ff:
                 json.dump(meta, ff, indent=2)
-            
+
             # Update metadata store
             with open(metadata_store_file, 'w') as f:
                 json.dump(data, f, indent=2)
-            
+
             return meta
 
         except (IOError, NameError) as e:

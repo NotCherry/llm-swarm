@@ -25,7 +25,7 @@ async def process_info(message, client_ip):
             await broadcast_layer_to_node(global_vars.LOCAL_ADDRESS, weights)
     if message['type'] == "layer_data":
         state_dict = message['data']
-        data_to_model(state_dict)
+        await data_to_model(state_dict)
         await save_local_layers(state_dict)                  
     if message['type'] == "layer_request":
         send_requested_layer(message['data']['target_node', message['data']['layer_name']])
@@ -71,7 +71,7 @@ async def process_info(message, client_ip):
         
         # the loop not ended run next iter
         # TODO: Limit token output
-        await broadcast_data_to_node(node_ip=global_vars.LOCAL_ADDRESS, data={ "type":"gen", "data": { "prompt" : output }})
+        await broadcast_data_to_node(node_ip=global_vars.MASTER_NODE_IP, data={ "type":"gen", "data": { "prompt" : output }})
 
         # retun user the respone
         if global_vars.LOCAL_ADDRESS != global_vars.MASTER_NODE_IP:
@@ -160,9 +160,27 @@ async def save_local_layers(state_dict):
         node_layer_loaded = {"type": "node_layer_loaded", "data": list(state_dict.keys())}
         await broadcast_data_to_node(global_vars.MASTER_NODE_IP, node_layer_loaded)
 
+        assert global_vars.MODEL is not None, "Model is not initialized"
+        assert global_vars.MODEL.state_dict()[list(state_dict.keys())[0]] is not None, "Model state dict is empty"
+
         r = [str(x) for x in range(global_vars.MODEL.shard.start_layer, global_vars.MODEL.shard.end_layer + 1)]
         condition1 = all(any(re.search(rf'\.layers\.{layer}\.', s) for s in global_vars.MODEL.loaded_keys) for layer in r)
-        condition2 = all( layer in global_vars.MODEL.loaded_keys for layer in  ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"] )
+
+        condition2_parts = []
+
+        # Check if first layer - need embed_tokens
+        if str(global_vars.MODEL.shard.start_layer) == str(min(int(x) for x in r)):
+            condition2_parts.append("model.embed_tokens.weight" in global_vars.MODEL.loaded_keys)
+
+        # Check if last layer - need norm and lm_head
+        if str(global_vars.MODEL.shard.n_layers - 1) == str(max(int(x) for x in r)):
+            condition2_parts.extend([
+                "model.norm.weight" in global_vars.MODEL.loaded_keys,
+                "lm_head.weight" in global_vars.MODEL.loaded_keys
+            ])
+
+        condition2 = len(condition2_parts) == 0 or all(condition2_parts)    
+
         if condition1 and condition2:
             log.info('Saving node weights')
             fn = f"{get_model_filename()}.safetensors"
@@ -262,9 +280,8 @@ from src.util import get_model_filename
 from src import global_vars
 
 async def data_to_model(state_dict):
-
     if global_vars.MODEL is None: 
-        init_model()
+        await init_model()
     global_vars.MODEL.load_state_dict(state_dict, strict=False)
     log.info(f"Loading layers to model: {state_dict.keys()}")
 
