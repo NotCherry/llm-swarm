@@ -178,9 +178,13 @@ async def save_local_layers(state_dict):
                 "model.norm.weight" in global_vars.MODEL.loaded_keys,
                 "lm_head.weight" in global_vars.MODEL.loaded_keys
             ])
+            
 
         condition2 = len(condition2_parts) == 0 or all(condition2_parts)    
 
+        
+        assert "lm_head.weight"  in state_dict.keys(), "Test stop here, lm_head should  be in state_dict"
+        
         if True:
             log.info('Saving node weights')
             fn = f"{get_model_filename()}.safetensors"

@@ -36,4 +36,5 @@ async def main():
     await swarm_discover(global_vars.SOCK_UDP)
 
 if __name__ == "__main__":
+    log.info("Starting Swarm Process")
     asyncio.run(main())

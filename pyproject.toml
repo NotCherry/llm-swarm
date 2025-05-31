@@ -26,6 +26,9 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[tool.uv.sources]
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "51d732709e5ae424e8fb6c4e58b72057a3e413c2" }
+
 [dependency-groups]
 dev = [
 ]
