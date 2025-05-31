@@ -9,17 +9,22 @@ import safetensors
 print(safetensors.__version__)
 # print(help(safetensors))
 
-file_a = "meta-llama!Llama-3.2-1B-Instruct.safetensors"
-file_b = "../model.safetensors"
+file_a = "Qwen!Qwen3-1.7B.safetensors"
+file_b = "../model-00002-of-00002.safetensors"
 layer_name = "model.embed_tokens.weight"
+l3= "model.layers.11.self_attn.q_norm.weight"
+l4 = "model.layers.11.mlp.up_proj.weight"
 l2 = "lm_head.weight"
 f, d, aa = safe_load_metadata_single(file_a)
-
-a = safe_load_by_layer(file_a, layer_prefix=l2)
-b = safe_load_by_layer(file_b, layer_prefix=layer_name)
-
-is_equal = torch.all(torch.eq(a[l2], b[layer_name]))
-assert is_equal, "model.embed_tokens.weight and lm_head.weight are not equal"
+sel_lay = l2
+a = safe_load_by_layer(file_a, layer_prefix=sel_lay)
+b = safe_load_by_layer(file_b, layer_prefix=sel_lay)
+print(aa)
+# b = safe_load_by_layer(file_b, layer_prefix=layer_name)
+print(a[sel_lay][:10])
+print(b[sel_lay][:10])
+# is_equal = torch.all(torch.eq(a[l2], b[layer_name]))
+# assert is_equal, "model.embed_tokens.weight and lm_head.weight are not equal"
 
 # for k in aa.keys():
 #     if "dummy" not in k:
@@ -29,11 +34,11 @@ assert is_equal, "model.embed_tokens.weight and lm_head.weight are not equal"
 #         is_equal = torch.all(torch.eq(a[k], b[k]))
 #         assert is_equal, k
 
-def tensor_to_bytes(v, k):
-    t = v.cpu() if v.device.type == "cuda" else v
-    t = t.contiguous()
-    return safetensors.torch._tobytes(t, k)
-import json
+# def tensor_to_bytes(v, k):
+#     t = v.cpu() if v.device.type == "cuda" else v
+#     t = t.contiguous()
+#     return safetensors.torch._tobytes(t, k)
+# import json
 # fn = "test.safetensors"
 # with open(fn, "wb") as f:
 #     new_meta = {"model.layers.0.input_layernorm.weight": {"dtype": "BF16", "shape": [2048], "data_offsets": [0, 4096]}}

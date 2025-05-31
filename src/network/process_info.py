@@ -159,7 +159,7 @@ async def save_local_layers(state_dict):
     with global_vars.MODEL_LOCK:
         node_layer_loaded = {"type": "node_layer_loaded", "data": list(state_dict.keys())}
         await broadcast_data_to_node(global_vars.MASTER_NODE_IP, node_layer_loaded)
-
+        
         assert global_vars.MODEL is not None, "Model is not initialized"
         assert global_vars.MODEL.state_dict()[list(state_dict.keys())[0]] is not None, "Model state dict is empty"
 
@@ -181,13 +181,14 @@ async def save_local_layers(state_dict):
 
         condition2 = len(condition2_parts) == 0 or all(condition2_parts)    
 
-        if condition1 and condition2:
+        if True:
             log.info('Saving node weights')
             fn = f"{get_model_filename()}.safetensors"
 
             mt = get_selected_model_metadata_from_index()
             if not os.path.exists(fn):
-                keys_in_order = global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers
+                # keys_in_order = global_vars.NETWORK_TOPOLOGY.nodes[global_vars.LOCAL_ADDRESS].loaded_layers
+                keys_in_order = list(state_dict.keys())
                 new_meta = {}
                 # get from mt all valid keys
                 for k in mt.keys():
@@ -215,7 +216,7 @@ async def save_local_layers(state_dict):
                     f.write(size.to_bytes(8, byteorder='little', signed=False))
                     f.write(meta_str)
                     for k in keys_in_order:
-                        t = tensor_to_bytes(global_vars.MODEL.state_dict()[k].to(dtype=str_to_torch_dtype(new_meta[k]['dtype'])), k)
+                        t = tensor_to_bytes(state_dict[k].to(dtype=str_to_torch_dtype(new_meta[k]['dtype'])), k)
                         f.write(t)
                     
                 return
@@ -224,13 +225,13 @@ async def save_local_layers(state_dict):
             # metadata_local - local file metadata
             # local metadata has dummy_layers
             f, data_start, local_metadata = safe_load_metadata_single(fn)
+            f.close()
             new_local_metadata = copy.deepcopy(local_metadata)
             last_data_offset = [v for k, v in new_local_metadata.items() if "dummy" not in k and "metadata" not in k][-1]
              
             keys_to_add = [key for key in mt if key not in local_metadata]
             if len(keys_to_add) == 0:
                 log.info("No new keys to add safetensors file")
-                f.close()
                 return
             log.info(f"Keys to add: {keys_to_add}")
 
@@ -246,8 +247,8 @@ async def save_local_layers(state_dict):
             s = 0
             for k in keys_to_add:
                 s = new_local_metadata[k]['data_offsets'][1] - new_local_metadata[k]['data_offsets'][0]
-                new_local_metadata[k]['data_offsets'] = [last_data_offset, last_data_offset + s]
-                last_data_offset += s
+                new_local_metadata[k]['data_offsets'] = [last_data_offset["data_offsets"][1], last_data_offset["data_offsets"][1] + s]
+                last_data_offset["data_offsets"][1] += s
 
 
             json_bytes = json.dumps(new_local_metadata).encode('utf-8')
@@ -263,11 +264,12 @@ async def save_local_layers(state_dict):
             # Final output
             final_output = json_bytes + padding
 
+            f = open(fn, "wb")
             f.seek(8)
             f.write(final_output)
             f.seek(keys_to_add[0]['data_offset'][0])
             for k in keys_to_add:
-                t = tensor_to_bytes(global_vars.MODEL.state_dict()[k].to(dtype=str_to_torch_dtype(new_meta[k]['dtype'])), k)
+                t = tensor_to_bytes(state_dict[k].to(dtype=str_to_torch_dtype(new_meta[k]['dtype'])), k)
                 f.write(t)            
             f.close()
 

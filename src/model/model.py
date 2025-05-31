@@ -5,7 +5,7 @@ import struct
 from typing import Dict, Union
 import requests
 import torch
-from src.qwen3 import Qwen3Model
+from src.qwen3_transformers_lib import Qwen3Model
 from src.ptcode import LlamaModel
 from src.structs import Shard
 from accelerate import init_empty_weights

@@ -3,7 +3,10 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel, Qwen3DecoderLayer, Qwen3RotaryEmbedding, create_causal_mask, create_sliding_window_causal_mask, Qwen3RMSNorm
+from transformers.models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel, Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm
+
+from src.lib_mask import create_causal_mask,create_sliding_window_causal_mask
+
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import logging
@@ -14,6 +17,7 @@ from src.structs import Shard
 from transformers import AutoTokenizer
 import src.global_vars as global_vars
 import os
+from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.get_logger(__name__)
 
@@ -29,17 +33,18 @@ QWEN3_1_7B_CONFIG = {
     "max_context_length": 32768 
 }
 
+QWEN3_1_7B_CONFIG_V2 = Qwen3Config(hidden_size=QWEN3_1_7B_CONFIG["hidden_size"], num_attention_heads=QWEN3_1_7B_CONFIG["num_attention_heads"], num_key_value_heads=QWEN3_1_7B_CONFIG["num_key_value_heads"], intermediate_size=QWEN3_1_7B_CONFIG["intermediate_size"], vocab_size=QWEN3_1_7B_CONFIG["vocab_size"], rope_theta=QWEN3_1_7B_CONFIG["rope_theta"], rms_norm_eps=QWEN3_1_7B_CONFIG["rms_norm_eps"], dtype=QWEN3_1_7B_CONFIG["dtype"], max_position_embeddings=QWEN3_1_7B_CONFIG["max_context_length"])
 
 class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: Qwen3Config, shard: Shard, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, shard: Shard,config: Qwen3Config = QWEN3_1_7B_CONFIG_V2,  device="cuda" if torch.cuda.is_available() else "cpu"):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.shard = shard
-        self.device = device
         self.model = nn.ModuleDict()
         self.loaded_keys = []
-        self.has_sliding_layers = "sliding_attention" in config.layer_types
+        # self.has_sliding_layers = "sliding_attention" in config.layer_types
+        self.has_sliding_layers = False  # Assuming sliding attention is not used in this version
         self.gradient_checkpointing = False
 
         # Initialize tokenizer and embedding only for the first shard
@@ -66,15 +71,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if self.shard.is_last_layer():
             self.model["norm"] = Qwen3RMSNorm(
                 config.hidden_size,
-                eps=config.rms_norm_eps,
-                dtype=config.dtype if hasattr(config, "dtype") else torch.float32
-            )
-            self.model["lm_head"] = nn.Linear(
+                eps=config.rms_norm_eps)
+            self.lm_head = nn.Linear(
                 config.hidden_size,
                 config.vocab_size,
-                bias=False,
-                dtype=config.dtype if hasattr(config, "dtype") else torch.float32
-            )
+                bias=False)
 
         # Initialize rotary embeddings (not sharded, as it’s typically shared across layers)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
@@ -154,7 +155,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 "full_attention": create_causal_mask(**mask_kwargs),
             }
             if self.has_sliding_layers:
-                attention_mask["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                # attention_mask["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                pass
 
         # Create position embeddings
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -187,14 +189,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # Final processing for the last shard
         if self.shard.is_last_layer():
             hidden_states = self.model["norm"](hidden_states)
-            logits = self.model["lm_head"](hidden_states)
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-                logits=logits,
-            )
+            logits = self.lm_head(hidden_states)
+            return logits
         else:
             # Return intermediate states for non-last shards
             return hidden_states, position_ids, attention_mask, past_key_values
