@@ -4,14 +4,19 @@ import time
 from typing import Dict
 from src.structs import NetworkConfig
 from src.local_logger import log
-
+from src import global_vars
 def get_outbound_ip():
+    if global_vars.LOCAL_ADDRESS is not None:
+        log.info(f"Using existing LOCAL_ADDRESS: {global_vars.LOCAL_ADDRESS}")
+        return global_vars.LOCAL_ADDRESS
+
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('1.1.1.1', 80))
         ip = s.getsockname()[0]
-    except Exception:
-        ip = None
+    except Exception as e:
+        assert False, f"Failed to get outbound IP: {e} cannot continue without internet access."
     finally:
         s.close()
 
